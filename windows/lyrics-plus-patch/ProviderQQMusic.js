@@ -1,14 +1,47 @@
 /**
  * ProviderQQMusic：QQ音乐歌词源（中文歌曲最佳覆盖）
- * - 直连官方接口（无第三方代理，稳定）
+ * - Spotify CEF 内受 CORS 限制，经本地代理（127.0.0.1:39871）转发
+ * - 代理不可用时自动降级为直连（curl 环境外场景仍可用），直连失败抛错给下一源
  * - 返回简体中文同步歌词（LRC 格式）
- * - 搜索后按「歌名精确 + 时长接近」智能匹配
+ * - 搜索后按「歌名精确 + 时长接近」智能匹配，歌名做繁→简归一化（覆盖繁体元数据歌曲）
  */
 const ProviderQQMusic = (() => {
+	const PROXY_BASE = "http://127.0.0.1:39871/?url=";
+	const SEARCH_API = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&n=10&w=";
+	const LYRIC_API = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?format=json&nobase64=1&musicid=";
+
 	const requestHeader = {
 		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:93.0) Gecko/20100101 Firefox/93.0",
 		Referer: "https://y.qq.com/",
 	};
+
+	/** 简体常见繁体字映射（用于歌名归一化匹配，非通用转换器） */
+	const TRAD_TO_SIMP = {
+		聲: "声", 無: "无", 哀: "哀", 樂: "乐", 舊: "旧", 年: "年", 倫: "伦", 傑: "杰",
+		愛: "爱", 萬: "万", 語: "语", 說: "说", 學: "学", 風: "风", 雲: "云", 龍: "龙",
+		鳳: "凤", 鳥: "鸟", 馬: "马", 車: "车", 東: "东", 陳: "陈", 劉: "刘", 黃: "黄",
+		張: "张", 吳: "吴", 趙: "赵", 錢: "钱", 孫: "孙", 書: "书", 畫: "画", 詩: "诗",
+		詞: "词", 曲: "曲", 詠: "咏", 唱: "唱", 夢: "梦", 飛: "飞", 藍: "蓝", 紅: "红",
+		綠: "绿", 黑: "黑", 白: "白", 光: "光", 影: "影", 時: "时", 間: "间", 門: "门",
+		開: "开", 關: "关", 長: "长", 短: "短", 遠: "远", 近: "近", 邊: "边", 鐘: "钟",
+	};
+
+	/** 歌名繁→简归一化（仅映射表覆盖的字，未映射字符保持原样） */
+	function normalizeToSimplified(s) {
+		return [...String(s ?? "")].map((ch) => TRAD_TO_SIMP[ch] ?? ch).join("");
+	}
+
+	/** GET 请求：本地代理优先，失败降级直连 */
+	async function qqGet(url) {
+		// 1. 本地代理（补 CORS 头，Spotify CEF 内可用）
+		try {
+			const res = await fetch(PROXY_BASE + encodeURIComponent(url), { headers: requestHeader });
+			if (res.ok) return await res.json();
+		} catch { /* 代理不可用 → 降级 */ }
+
+		// 2. 直连（代理未启动场景；CEF 内会 CORS 失败，由调用方捕获交给下一源）
+		return await Spicetify.CosmosAsync.get(url, null, requestHeader);
+	}
 
 	/** 取第一主唱歌手（Spotify 多歌手格式：A / B 或 A, B） */
 	function firstArtist(artist) {
@@ -19,28 +52,27 @@ const ProviderQQMusic = (() => {
 	}
 
 	async function findLyrics(info) {
-		const searchURL = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&n=10&w=";
-		const lyricURL = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?format=json&nobase64=1&musicid=";
-
 		const cleanTitle = Utils.removeExtraInfo(Utils.removeSongFeat(Utils.normalize(info.title)));
 		if (!cleanTitle) throw "Cannot find track";
 
 		const query = `${cleanTitle} ${firstArtist(info.artist)}`.trim();
-		const searchResults = await Spicetify.CosmosAsync.get(searchURL + encodeURIComponent(query), null, requestHeader);
+		const searchResults = await qqGet(SEARCH_API + encodeURIComponent(query));
 		const items = searchResults?.data?.song?.list;
 		if (!items?.length) throw "Cannot find track";
 
-		// 匹配策略：歌名精确 + 时长接近 > 时长接近 > 歌名精确
+		// 匹配策略（歌名比较统一归一化为简体，兼容繁体元数据）
+		const simpTitle = normalizeToSimplified(cleanTitle);
+		const nameOf = (val) => normalizeToSimplified(val?.songname ?? "");
 		const durationDiff = (val) => Math.abs(info.duration - (val?.interval ?? 0) * 1000);
-		let itemId = items.findIndex((val) => val.songname === cleanTitle && durationDiff(val) < 3000);
+		let itemId = items.findIndex((val) => nameOf(val) === simpTitle && durationDiff(val) < 3000);
 		if (itemId === -1) itemId = items.findIndex((val) => durationDiff(val) < 3000);
-		if (itemId === -1) itemId = items.findIndex((val) => val.songname === cleanTitle);
+		if (itemId === -1) itemId = items.findIndex((val) => nameOf(val) === simpTitle);
 		if (itemId === -1) throw "Cannot find track";
 
 		const songId = items[itemId].songid;
 		if (!songId) throw "Cannot find track";
 
-		return await Spicetify.CosmosAsync.get(lyricURL + songId, null, requestHeader);
+		return await qqGet(LYRIC_API + songId);
 	}
 
 	const creditInfo = [
