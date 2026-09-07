@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 纯 framework 主题（零 AndroidX 依赖），深色 -->
+    <style name="Theme.SpotifyLyrics" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#121212</item>
+        <item name="android:statusBarColor">#121212</item>
+        <item name="android:navigationBarColor">#121212</item>
+        <item name="android:colorAccent">#1DB954</item>
+        <item name="android:colorPrimary">#1DB954</item>
+    </style>
+</resources>
