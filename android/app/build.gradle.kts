@@ -17,10 +17,21 @@ android {
         versionName = "1.0.0"
     }
 
+    // Release 用 debug 密钥签名（个人开源工具，便于直接分发；如需正式签名请替换）
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

@@ -3,7 +3,9 @@ node_modules/
 
 # ── 构建产物（源码可重建） ──
 windows/dist/
+windows/build/
 android/.gradle/
+android/.kotlin/
 android/build/
 android/app/build/
 android/core/build/
