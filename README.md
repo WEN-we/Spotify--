@@ -65,14 +65,24 @@ spicetify config extensions t2s-converter.js
 spicetify apply
 ```
 
-日常使用前启动 QQ 音乐本地代理（新开一个终端，保持运行）：
+QQ音乐源依赖本地代理（监听 127.0.0.1:39871）。推荐注册开机自启（登录后 30 秒自动启动，异常退出自动重启）：
+
+```powershell
+$action   = New-ScheduledTaskAction -Execute "wscript.exe" -Argument """<项目路径>\windows\services\start-proxy.vbs"""
+$trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$trigger.Delay = "PT30S"
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName "SpotifyQQProxy" -Action $action -Trigger $trigger -Settings $settings -Force
+```
+
+或临时手动启动（新开一个终端，保持运行）：
 
 ```powershell
 cd windows
-node services/qqProxy.mjs   # 监听 127.0.0.1:39871
+node services/qqProxy.mjs
 ```
 
-> qqProxy 仅监听本机回环地址，且仅允许转发至 `c.y.qq.com` 白名单端点。
+> qqProxy 仅监听本机回环地址，且仅允许转发至 `c.y.qq.com` 白名单端点。代理未运行时 lyrics-plus 自动回退 LRCLIB 源，仅 QQ 音乐源不可用。
 
 > Spicetify 更新可能覆盖 lyrics-plus，歌词源失效时重新执行第 3 步即可（脚本幂等）。
 
