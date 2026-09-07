@@ -1,14 +1,31 @@
 /**
  * ProviderQQMusic：QQ音乐歌词源（中文歌曲最佳覆盖）
  * - Spotify CEF 内受 CORS 限制，经本地代理（127.0.0.1:39871）转发
- * - 代理不可用时自动降级为直连（curl 环境外场景仍可用），直连失败抛错给下一源
+ * - 注意：CEF 安全策略拦截 query 中携带完整外部 URL 的请求（?url=https%3A%2F%2F...），
+ *   故代理端点使用路径参数（/search?q= 与 /lyric/<id>），query 中不出现 "://" 模式
+ * - 代理不可用时自动降级为直连（外部环境仍可用），直连失败抛错给下一源
  * - 返回简体中文同步歌词（LRC 格式）
  * - 搜索后按「歌名精确 + 时长接近」智能匹配，歌名做繁→简归一化（覆盖繁体元数据歌曲）
  */
 const ProviderQQMusic = (() => {
-	const PROXY_BASE = "http://127.0.0.1:39871/?url=";
+	const PROXY_SEARCH = "http://127.0.0.1:39871/search?q=";
+	const PROXY_LYRIC = "http://127.0.0.1:39871/lyric/";
 	const SEARCH_API = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&n=10&w=";
 	const LYRIC_API = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?format=json&nobase64=1&musicid=";
+
+	/** 调试埋点：写入 localStorage（保留最新 20 条），供外部诊断 CEF 内真实行为 */
+	const DEBUG_KEY = "lyrics-plus:debug:qqmusic";
+	function debugLog(stage, data) {
+		try {
+			const arr = JSON.parse(localStorage.getItem(DEBUG_KEY) ?? "[]");
+			arr.push({
+				t: new Date().toISOString().slice(11, 19),
+				stage,
+				d: typeof data === "string" ? data.slice(0, 200) : data,
+			});
+			localStorage.setItem(DEBUG_KEY, JSON.stringify(arr.slice(-20)));
+		} catch {}
+	}
 
 	const requestHeader = {
 		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:93.0) Gecko/20100101 Firefox/93.0",
@@ -31,16 +48,33 @@ const ProviderQQMusic = (() => {
 		return [...String(s ?? "")].map((ch) => TRAD_TO_SIMP[ch] ?? ch).join("");
 	}
 
-	/** GET 请求：本地代理优先，失败降级直连 */
-	async function qqGet(url) {
+	/**
+	 * GET 请求：本地代理优先（路径参数，避开 CEF 对 query 中外部 URL 的拦截），失败降级直连
+	 * @param {string} proxyUrl 本地代理 URL（不含外部 URL 的 query）
+	 * @param {string} directUrl QQ 音乐直连 URL（降级用）
+	 */
+	async function qqGet(proxyUrl, directUrl) {
 		// 1. 本地代理（补 CORS 头，Spotify CEF 内可用）
 		try {
-			const res = await fetch(PROXY_BASE + encodeURIComponent(url), { headers: requestHeader });
-			if (res.ok) return await res.json();
-		} catch { /* 代理不可用 → 降级 */ }
+			const res = await fetch(proxyUrl, { headers: requestHeader });
+			if (res.ok) {
+				debugLog("proxy-ok", proxyUrl.slice(0, 60));
+				return await res.json();
+			}
+			debugLog("proxy-status", `${res.status} ${proxyUrl.slice(0, 60)}`);
+		} catch (e) {
+			debugLog("proxy-fail", `${e?.message ?? e} ${proxyUrl.slice(0, 60)}`);
+		}
 
-		// 2. 直连（代理未启动场景；CEF 内会 CORS 失败，由调用方捕获交给下一源）
-		return await Spicetify.CosmosAsync.get(url, null, requestHeader);
+		// 2. 直连（代理未启动场景；CEF 内会因 CORS/Origin 拦截返回空，由调用方判断）
+		try {
+			const direct = await Spicetify.CosmosAsync.get(directUrl, null, requestHeader);
+			debugLog("direct-ok", directUrl.slice(0, 60));
+			return direct;
+		} catch (e) {
+			debugLog("direct-fail", `${e?.message ?? e} ${directUrl.slice(0, 60)}`);
+			throw e;
+		}
 	}
 
 	/** 取第一主唱歌手（Spotify 多歌手格式：A / B 或 A, B） */
@@ -56,8 +90,10 @@ const ProviderQQMusic = (() => {
 		if (!cleanTitle) throw "Cannot find track";
 
 		const query = `${cleanTitle} ${firstArtist(info.artist)}`.trim();
-		const searchResults = await qqGet(SEARCH_API + encodeURIComponent(query));
+		debugLog("search-start", `${query} | dur=${info.duration}ms | raw=${info.title}`);
+		const searchResults = await qqGet(PROXY_SEARCH + encodeURIComponent(query), SEARCH_API + encodeURIComponent(query));
 		const items = searchResults?.data?.song?.list;
+		debugLog("search-result", `count=${items?.length ?? 0}`);
 		if (!items?.length) throw "Cannot find track";
 
 		// 匹配策略（歌名比较统一归一化为简体，兼容繁体元数据）
@@ -67,12 +103,18 @@ const ProviderQQMusic = (() => {
 		let itemId = items.findIndex((val) => nameOf(val) === simpTitle && durationDiff(val) < 3000);
 		if (itemId === -1) itemId = items.findIndex((val) => durationDiff(val) < 3000);
 		if (itemId === -1) itemId = items.findIndex((val) => nameOf(val) === simpTitle);
-		if (itemId === -1) throw "Cannot find track";
+		if (itemId === -1) {
+			debugLog("match-fail", `target="${simpTitle}" candidates=${items.map((v) => `${v.songname}/${v.singer?.[0]?.name}/${v.interval}s`).join("; ").slice(0, 200)}`);
+			throw "Cannot find track";
+		}
+		debugLog("match-hit", `#${itemId} ${items[itemId].songname} / ${items[itemId].singer?.[0]?.name}`);
 
 		const songId = items[itemId].songid;
 		if (!songId) throw "Cannot find track";
 
-		return await qqGet(LYRIC_API + songId);
+		const lyricBody = await qqGet(PROXY_LYRIC + songId, LYRIC_API + songId);
+		debugLog("lyric-fetch", `len=${lyricBody?.lyric?.length ?? 0}`);
+		return lyricBody;
 	}
 
 	const creditInfo = [
@@ -111,7 +153,10 @@ const ProviderQQMusic = (() => {
 
 	function getSynced(list) {
 		const lyricStr = list?.lyric;
-		if (!lyricStr) return null;
+		if (!lyricStr) {
+			debugLog("no-lyric-field", "lyric 字段为空");
+			return null;
+		}
 
 		let noLyrics = false;
 		const lyrics = parseLrc(lyricStr)
@@ -122,9 +167,13 @@ const ProviderQQMusic = (() => {
 			})
 			.filter(Boolean);
 
-		if (!lyrics.length || noLyrics) return null;
+		if (!lyrics.length || noLyrics) {
+			debugLog("parse-empty", `raw lines=${lyricStr.split("\n").length} noLyrics=${noLyrics}`);
+			return null;
+		}
+		debugLog("parse-ok", `lines=${lyrics.length} first="${lyrics[0]?.text ?? ""}"`);
 		return lyrics;
 	}
 
-	return { findLyrics, getSynced };
+	return { findLyrics, getSynced, debugLog };
 })();

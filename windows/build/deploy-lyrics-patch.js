@@ -113,7 +113,8 @@ const qqmusicImpl = `	qqmusic: async (info) => {
 		let body;
 		try {
 			body = await ProviderQQMusic.findLyrics(info);
-		} catch {
+		} catch (e) {
+			ProviderQQMusic.debugLog("provider-error", String(e?.message ?? e).slice(0, 200));
 			result.error = "No lyrics";
 			return result;
 		}
