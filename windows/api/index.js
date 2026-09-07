@@ -45,11 +45,17 @@ function boot() {
 }
 
 /**
- * Spicetify 扩展入口
- * Spicetify 加载扩展后调用 main()
+ * Spicetify 扩展入口（经典 script IIFE 模式，参考官方扩展惯例）
+ * 菜单注册依赖 Spicetify 就绪；转换核心不依赖。等待就绪后启动，超时后仍启动（菜单静默降级）。
  */
-async function main() {
+(function main(retries = 100) {
+  if (typeof Spicetify === 'undefined' || !Spicetify?.Platform) {
+    if (retries > 0) {
+      setTimeout(() => main(retries - 1), 300);
+    } else {
+      safe(boot, null, 'BOOT_TIMEOUT_FALLBACK'); // 超时：仍启动核心转换（菜单降级）
+    }
+    return;
+  }
   safe(boot, null, 'BOOT_FAILED');
-}
-
-export default main;
+})();

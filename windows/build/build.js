@@ -17,7 +17,7 @@ const isDeploy = process.argv.includes('--deploy');
 await build({
   entryPoints: [join(ROOT, 'api', 'index.js')],
   bundle: true,
-  format: 'esm',
+  format: 'iife', // Spicetify 扩展经经典 <script> 标签加载，必须 IIFE（ESM 的 export 会语法报错）
   outfile: DIST_FILE,
   minify: true,
   target: ['chrome110'],
