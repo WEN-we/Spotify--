@@ -10,7 +10,7 @@ import kotlin.test.assertTrue
  * QqMusicClient 解析与匹配单元测试（纯 JVM，不触网络）
  * 覆盖：
  *  - client_search_cp 经典响应 / qqProxy 种子缓存精简数据 / musicu.fcg 桌面端响应 / 频控分类
- *  - 歌手感知匹配（防跨语言/跨歌手错配——「Give up」事故回归测试）
+ *  - 匹配：歌手感知优先（防跨歌曲错配）+ 兜底取最热同名版本（「Give up」场景，用户要求）
  */
 class QqMusicClientTest {
 
@@ -136,8 +136,9 @@ class QqMusicClientTest {
     }
 
     @Test
-    fun `smartbox 真实场景 GIve up 歌手不符全部拒绝`() {
-        // 实测「GIve up」smartbox 候选全为其他歌手（Seven./拖鞋pd/Tamboss）→ 全部拒绝
+    fun `smartbox 真实场景 GIve up 兜底最热翻唱版`() {
+        // 实测「GIve up」smartbox 候选全为其他歌手（Seven./拖鞋pd/Tamboss）
+        // → 无原唱时按用户要求取最热同名版本（首位 = Seven.）
         val cands = QqMusicClient.parseSmartboxSearch(
             """{"code":0,"data":{"song":{"itemlist":[
               {"name":"GIve up","singer":"Seven.","docid":"686771923"},
@@ -145,7 +146,8 @@ class QqMusicClientTest {
               {"name":"Give Up","singer":"Tamboss","docid":"668717634"}
             ]}}}""",
         )
-        assertNull(QqMusicClient.matchCandidate(cands, "Give up", "CJX7816", 141_000))
+        val hit = QqMusicClient.matchCandidate(cands, "Give up", "CJX7816", 141_000)
+        assertEquals(686771923L, hit?.songId)
     }
 
     @Test
@@ -180,10 +182,27 @@ class QqMusicClientTest {
     }
 
     @Test
-    fun `事故回归 歌名相同歌手不同拒绝匹配`() {
-        // 「Give up」CJX7816 vs QQ「GIve up」Seven.：歌名相等（忽略大小写）但歌手完全不同 → 拒绝
+    fun `兜底 歌名相同歌手不同取最热版本`() {
+        // 「Give up」CJX7816 vs QQ「GIve up」Seven.：无原唱 → 兜底取最热同名版本（规则5）
         val cands = listOf(cand(686771923, "GIve up", 141, "Seven."))
-        assertNull(QqMusicClient.matchCandidate(cands, "Give up", "CJX7816", 141_000))
+        val hit = QqMusicClient.matchCandidate(cands, "Give up", "CJX7816", 141_000)
+        assertEquals(686771923L, hit?.songId)
+    }
+
+    @Test
+    fun `兜底 歌名包含版本后缀取首位`() {
+        // 仅存在「Give Up（感觉至上）」类带后缀候选 → 规则6 兜底命中
+        val cands = listOf(cand(695418885, "GIve Up（感觉至上）", 0, "拖鞋pd/Rush Surge"))
+        val hit = QqMusicClient.matchCandidate(cands, "Give up", "CJX7816", 141_000)
+        assertEquals(695418885L, hit?.songId)
+    }
+
+    @Test
+    fun `兜底不影响原唱优先`() {
+        // 有原唱（歌手兼容）时规则1仍优先于兜底，绝不让翻唱抢原唱
+        val cands = listOf(cand(1, "晴天", 269, "翻唱歌手"), cand(2, "晴天", 269, "周杰伦"))
+        val hit = QqMusicClient.matchCandidate(cands, "晴天", "周杰伦", 269_000)
+        assertEquals(2L, hit?.songId)
     }
 
     @Test

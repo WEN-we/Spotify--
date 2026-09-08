@@ -230,9 +230,12 @@ object QqMusicClient {
      *  2. 歌名相等 + 时长未知(种子缓存 interval=0) + 歌手兼容
      *  3. 歌名相等 + 歌手兼容（时长不一致：同歌手 Live/不同版本）
      *  4. 歌名包含（Live/feat 后缀）+ 时长接近 + 歌手兼容
+     *  5. 兜底：歌名相等（忽略大小写/繁简/歌手）→ 取搜索首位（QQ 搜索序≈热度，翻唱版歌词）
+     *  6. 兜底：歌名包含（Live/feat/版本后缀）→ 取首位
      * 歌手兼容 = 候选歌手任一部分与本地歌手双向包含（大小写/繁简不敏感）；
      * 候选歌手为空（种子缓存）或本地歌手为空时放行。
-     * 禁止纯时长匹配（曾致英文歌匹配到同时长中文歌）。
+     * 禁止纯时长匹配（曾致英文歌匹配到同时长中文歌）——5/6 仍要求歌名一致/包含，
+     * 跨歌曲错配（Give up→江声入旧年）依旧不可能。
      */
     internal fun matchCandidate(
         cands: List<Cand>,
@@ -264,6 +267,10 @@ object QqMusicClient {
             ?: cands.firstOrNull { nameEq(it) && durUnknown(it) && artistOk(it) }
             ?: cands.firstOrNull { nameEq(it) && artistOk(it) }
             ?: cands.firstOrNull { nameSimilar(it) && durClose(it) && artistOk(it) }
+            // 兜底（用户要求）：找不到原作者 → 使用其他歌手最热版本（QQ 搜索序≈热度）。
+            // 注意：本函数保持纯函数（可单测），兜底命中与否的日志由 fetchInternal 统一输出
+            ?: cands.firstOrNull { nameEq(it) }
+            ?: cands.firstOrNull { nameSimilar(it) }
     }
 
     // ── 歌词链路 ──

@@ -124,7 +124,8 @@ const ProviderQQMusic = (() => {
 
 		// 匹配策略（歌手感知，v2）：歌名相等（大小写/繁简不敏感）为主，
 		// 歌手兼容（双向包含）为约束，时长接近为辅助；禁止纯时长匹配
-		// （曾致英文歌「Give up」匹配到同时长/同名不同歌手的中文歌）
+		// （曾致英文歌「Give up」匹配到同时长/同名不同歌手的中文歌）。
+		// 兜底（v3）：无原唱时按用户要求取其他歌手最热同名版本（QQ 搜索序≈热度）
 		const simpTitle = normalizeToSimplified(cleanTitle).trim().toLowerCase();
 		const wantArtist = normalizeToSimplified(firstArtist(info.artist)).trim().toLowerCase();
 		const nameOf = (val) => normalizeToSimplified(val?.songname ?? "").trim().toLowerCase();
@@ -148,6 +149,9 @@ const ProviderQQMusic = (() => {
 		if (itemId === -1) itemId = items.findIndex((val) => nameEq(val) && durUnknown(val) && artistOk(val));
 		if (itemId === -1) itemId = items.findIndex((val) => nameEq(val) && artistOk(val));
 		if (itemId === -1) itemId = items.findIndex((val) => nameSimilar(val) && durClose(val) && artistOk(val));
+		// 兜底：歌名一致/包含即可，取搜索首位（最热版本）——跨歌曲错配依旧不可能
+		if (itemId === -1) itemId = items.findIndex((val) => nameEq(val));
+		if (itemId === -1) itemId = items.findIndex((val) => nameSimilar(val));
 		if (itemId === -1) {
 			debugLog("match-fail", `target="${simpTitle}/${wantArtist}" candidates=${items.map((v) => `${v.songname}/${v.singer?.[0]?.name}/${v.interval}s`).join("; ").slice(0, 200)}`);
 			throw "Cannot find track";
