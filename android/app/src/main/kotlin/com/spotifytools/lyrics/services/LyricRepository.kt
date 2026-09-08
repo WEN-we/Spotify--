@@ -25,7 +25,10 @@ class LyricRepository(context: Context) {
     data class FetchResult(val lines: List<LrcLine>, val source: String)
 
     private val cache = LyricsCache(context)
-    private val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // 双线程池：LRCLIB 与 QQ音乐真正并行竞速（串行最坏 16s → 并行最快即时，最坏 8s）
+    private val executor = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+        Thread(r).apply { isDaemon = true; name = "lyric-fetch" }
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /** 异步获取歌词（回调主线程；缓存命中走快路径） */
@@ -42,47 +45,63 @@ class LyricRepository(context: Context) {
             mainHandler.post { onDone(Result.Success(FetchResult(convert(cached), SOURCE_CACHE))) }
             return
         }
-        // 慢路径：网络请求（LRCLIB → QQ音乐 回退）
-        executor.execute {
-            val result = fetchFromNetwork(trackName, artistName, durationMs)
-            mainHandler.post { onDone(result) }
-        }
+        fetchFromNetwork(trackName, artistName, durationMs, onDone)
     }
 
+    /** 逐出单曲缓存（手动刷新用） */
+    fun evict(trackName: String, artistName: String) = cache.evict(trackName, artistName)
+
+    /**
+     * 双源并行竞速：LRCLIB 与 QQ音乐同时发起，先成功者胜出（不等慢源）。
+     * 全部失败时聚合错误：network 类优先（供 LyricsService 20s 重试）。
+     */
     private fun fetchFromNetwork(
         trackName: String,
         artistName: String,
         durationMs: Long,
-    ): Result<FetchResult> {
+        onDone: (Result<FetchResult>) -> Unit,
+    ) {
         val durationSec = if (durationMs > 0) durationMs / 1000 else 0
-        val sources = listOf(
-            "LRCLIB" to { LrclibClient.fetch(trackName, artistName, durationSec).map { it.syncedLrc } },
-            "QQ音乐" to { QqMusicClient.fetch(trackName, artistName, durationMs).map { it.syncedLrc } },
-        )
+        val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+        val pending = java.util.concurrent.atomic.AtomicInteger(2)
+        val errors = java.util.Collections.synchronizedList(mutableListOf<Pair<String, AppError>>())
 
-        var lastError: AppError = AppError.noResult("无可用歌词源")
-        for ((name, fetcher) in sources) {
-            when (val fetched = fetcher()) {
+        // 全部源失败后统一回调（network 错误优先 → 触发上层重试）
+        fun allFailed() {
+            if (finished.getAndSet(true)) return
+            val err = errors.firstOrNull { it.second.code == AppError.CODE_NETWORK }?.second
+                ?: errors.firstOrNull()?.second
+                ?: AppError.noResult("无可用歌词源")
+            LogKit.i("歌词未找到: $trackName - ${err.message}")
+            mainHandler.post { onDone(Result.Failure(err)) }
+        }
+
+        fun handle(name: String, fetched: Result<String>) {
+            if (finished.get()) return
+            when (fetched) {
                 is Result.Success -> {
                     val lines = sanitize(LrcParser.parse(fetched.data))
-                    if (lines.isEmpty()) {
-                        // 该源解析后无有效行（如仅制作人员信息）→ 尝试下一源
-                        LogKit.d("$name 解析为空，回退下一源: $trackName")
-                        lastError = AppError.parse("$name 歌词为空")
-                        continue
+                    if (lines.isNotEmpty() && finished.compareAndSet(false, true)) {
+                        cache.put(trackName, artistName, fetched.data)
+                        LogKit.i("歌词获取成功($name): $trackName (${lines.size} 行)")
+                        mainHandler.post { onDone(Result.Success(FetchResult(convert(lines), name))) }
+                        return
                     }
-                    cache.put(trackName, artistName, fetched.data)
-                    LogKit.i("歌词获取成功($name): $trackName (${lines.size} 行)")
-                    return Result.Success(FetchResult(convert(lines), name))
+                    if (lines.isEmpty()) {
+                        LogKit.d("$name 解析为空: $trackName")
+                        errors.add(name to AppError.parse("$name 歌词为空"))
+                    }
                 }
                 is Result.Failure -> {
                     LogKit.d("$name 失败: ${fetched.error.message}")
-                    lastError = fetched.error
+                    errors.add(name to fetched.error)
                 }
             }
+            if (pending.decrementAndGet() == 0) allFailed()
         }
-        LogKit.i("歌词未找到: $trackName - ${lastError.message}")
-        return Result.Failure(lastError)
+
+        executor.execute { handle("LRCLIB", LrclibClient.fetch(trackName, artistName, durationSec).map { it.syncedLrc }) }
+        executor.execute { handle("QQ音乐", QqMusicClient.fetch(trackName, artistName, durationMs).map { it.syncedLrc }) }
     }
 
     /** 过滤制作人员行（作词/作曲/编曲/混音等 credits），保留纯音乐提示行 */

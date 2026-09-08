@@ -52,6 +52,11 @@ object AppConfig {
         get() = prefs.getInt("floating_y", -1)
         set(value) = prefs.edit().putInt("floating_y", value).apply()
 
+    /** 歌词偏移校准（毫秒；正值 = 歌词延后显示，即歌词偏快时调正；±10s 内有效） */
+    var lyricOffsetMs: Int
+        get() = prefs.getInt("lyric_offset_ms", 0).coerceIn(-10_000, 10_000)
+        set(value) = prefs.edit().putInt("lyric_offset_ms", value.coerceIn(-10_000, 10_000)).apply()
+
     var lrclibBase: String
         get() = prefs.getString(KEY_LRCLIB_BASE, DEFAULT_LRCLIB_BASE) ?: DEFAULT_LRCLIB_BASE
         set(value) = prefs.edit().putString(KEY_LRCLIB_BASE, value).apply()

@@ -52,6 +52,15 @@ class LyricsCache(context: Context) {
 
     fun size(): Int = cacheDir.listFiles()?.size ?: 0
 
+    /** 逐出单曲缓存（手动刷新：强制走网络重新获取） */
+    fun evict(trackName: String, artistName: String) {
+        val f = File(cacheDir, keyOf(trackName, artistName) + ".json")
+        if (f.exists()) {
+            runCatchingApp(AppError.storage("逐出缓存失败")) { f.delete() }
+            LogKit.d("已逐出缓存: $trackName")
+        }
+    }
+
     fun clear() {
         cacheDir.listFiles()?.forEach { it.delete() }
         LogKit.i("歌词缓存已清空")

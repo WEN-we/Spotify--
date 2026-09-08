@@ -41,6 +41,7 @@ class MainActivity : Activity() {
     private lateinit var nowArtist: TextView
     private lateinit var nowSource: TextView
     private lateinit var fontSizeValue: TextView
+    private lateinit var offsetValue: TextView
     private lateinit var cacheCount: TextView
     private lateinit var permContainer: LinearLayout
     private var playbackObserver: ((PlaybackBus.State?) -> Unit)? = null
@@ -99,7 +100,26 @@ class MainActivity : Activity() {
 
         // ── 正在播放卡片 ──
         val nowCard = card().apply {
-            addView(label("正在播放"))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(label("正在播放").apply {
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                // 手动刷新：清当前曲缓存并重新获取（歌词源更新/首次失败时使用）
+                addView(smallButton("重新获取") {
+                    if (LyricsService.refreshLyrics(this@MainActivity)) {
+                        PlaybackBus.currentState?.let { st ->
+                            nowSource.text = "正在获取歌词…"
+                            nowSource.setTextColor(gray)
+                            pollSourceLabel(st.trackId, 0)
+                        }
+                        Toast.makeText(this@MainActivity, "已重新获取", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "当前无播放歌曲", Toast.LENGTH_SHORT).show()
+                    }
+                })
+            })
             nowTitle = value().apply { text = "等待播放…" }
             addView(nowTitle)
             nowArtist = TextView(this@MainActivity).apply {
@@ -167,6 +187,39 @@ class MainActivity : Activity() {
                     override fun onStartTrackingTouch(sb: SeekBar?) {}
                     override fun onStopTrackingTouch(sb: SeekBar?) {}
                 })
+            })
+
+            // 歌词偏移校准：歌词偏快调「+」（延后），偏慢调「-」（提前）；500ms 内生效
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 20, 0, 4)
+                addView(TextView(this@MainActivity).apply {
+                    text = "歌词校准"
+                    textSize = 16f
+                    setTextColor(Color.WHITE)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                offsetValue = TextView(this@MainActivity).apply {
+                    textSize = 14f
+                    setTextColor(green)
+                }
+                addView(offsetValue)
+                updateOffsetLabel()
+            })
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 4, 0, 0)
+                addView(smallButton("-1s") { adjustOffset(-1000) })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("-0.5s") { adjustOffset(-500) })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("+0.5s") { adjustOffset(500) })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("+1s") { adjustOffset(1000) })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("重置") { adjustOffset(-AppConfig.lyricOffsetMs) })
             })
         }
         page.addView(settingCard, cardParams())
@@ -312,6 +365,21 @@ class MainActivity : Activity() {
 
     private fun updateFontLabel() {
         fontSizeValue.text = "${AppConfig.fontSize.toInt()}sp"
+    }
+
+    /** 偏移校准：调整后立即持久化，悬浮窗下一次渲染（≤500ms）自动生效 */
+    private fun adjustOffset(deltaMs: Int) {
+        AppConfig.lyricOffsetMs = AppConfig.lyricOffsetMs + deltaMs
+        updateOffsetLabel()
+    }
+
+    private fun updateOffsetLabel() {
+        val ms = AppConfig.lyricOffsetMs
+        offsetValue.text = when {
+            ms == 0 -> "同步"
+            ms > 0 -> "+%.1fs".format(ms / 1000f)
+            else -> "%.1fs".format(ms / 1000f)
+        }
     }
 
     // ── 状态刷新 ──

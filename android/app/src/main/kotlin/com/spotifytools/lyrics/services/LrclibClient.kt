@@ -4,7 +4,6 @@ import com.spotifytools.lyrics.config.AppConfig
 import com.spotifytools.lyrics.utils.AppError
 import com.spotifytools.lyrics.utils.LogKit
 import com.spotifytools.lyrics.utils.Result
-import com.spotifytools.lyrics.utils.runCatchingApp
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -44,34 +43,46 @@ object LrclibClient {
         return search(trackName, artistName)
     }
 
-    /** GET /api/get —— 精确匹配 */
-    private fun getExact(trackName: String, artistName: String, durationSec: Long): Result<LyricsResult> =
-        runCatchingApp(AppError.network("LRCLIB 请求失败")) {
-            val url = buildString {
-                append(AppConfig.lrclibBase).append("/api/get?")
-                append("artist_name=").append(enc(artistName))
-                append("&track_name=").append(enc(trackName))
-                if (durationSec > 0) append("&duration=").append(durationSec)
-            }
-            val body = httpGet(url)
-            parseLyrics(JSONObject(body)) ?: throw NoSuchFieldException("无 syncedLyrics 字段")
+    /** GET /api/get —— 精确匹配（HTTP 失败 network；无字段属正常，交给降级搜索） */
+    private fun getExact(trackName: String, artistName: String, durationSec: Long): Result<LyricsResult> {
+        val url = buildString {
+            append(AppConfig.lrclibBase).append("/api/get?")
+            append("artist_name=").append(enc(artistName))
+            append("&track_name=").append(enc(trackName))
+            if (durationSec > 0) append("&duration=").append(durationSec)
         }
+        return try {
+            val body = httpGet(url)
+            val parsed = parseLyrics(JSONObject(body))
+            if (parsed != null) Result.Success(parsed)
+            else Result.Failure(AppError.noResult("无 syncedLyrics 字段"))
+        } catch (e: java.io.IOException) {
+            LogKit.d("LRCLIB get 失败: ${e.message}")
+            Result.Failure(AppError.network("LRCLIB 请求失败"))
+        }
+    }
 
-    /** GET /api/search —— 模糊搜索，取首个含同步歌词的结果 */
-    private fun search(trackName: String, artistName: String): Result<LyricsResult> =
-        runCatchingApp(AppError.noResult("LRCLIB 搜索失败")) {
-            val url = buildString {
-                append(AppConfig.lrclibBase).append("/api/search?")
-                append("track_name=").append(enc(trackName))
-                append("&artist_name=").append(enc(artistName))
-            }
+    /** GET /api/search —— 模糊搜索（HTTP 失败 network 触发重试；无结果 noResult） */
+    private fun search(trackName: String, artistName: String): Result<LyricsResult> {
+        val url = buildString {
+            append(AppConfig.lrclibBase).append("/api/search?")
+            append("track_name=").append(enc(trackName))
+            append("&artist_name=").append(enc(artistName))
+        }
+        return try {
             val arr = JSONArray(httpGet(url))
+            var hit: LyricsResult? = null
             for (i in 0 until arr.length()) {
                 val item = parseLyrics(arr.getJSONObject(i))
-                if (item != null) return@runCatchingApp item
+                if (item != null) { hit = item; break }
             }
-            throw NoSuchFieldException("搜索无同步歌词结果")
+            if (hit != null) Result.Success(hit)
+            else Result.Failure(AppError.noResult("LRCLIB 无同步歌词结果"))
+        } catch (e: java.io.IOException) {
+            LogKit.d("LRCLIB search 失败: ${e.message}")
+            Result.Failure(AppError.network("LRCLIB 请求失败"))
         }
+    }
 
     private fun parseLyrics(obj: JSONObject): LyricsResult? {
         val synced = obj.optString("syncedLyrics", "")

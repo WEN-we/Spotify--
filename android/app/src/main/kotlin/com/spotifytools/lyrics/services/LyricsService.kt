@@ -164,7 +164,8 @@ class LyricsService : Service() {
         val playback = currentPlayback ?: return
         if (currentLines.isEmpty()) return
 
-        val position = playback.currentPosition()
+        // 应用歌词偏移校准（正值延后显示）；进度快照由 2s 轮询自动回正，此处只做轴偏移
+        val position = playback.currentPosition() - AppConfig.lyricOffsetMs
         // 二分查找当前行
         var lo = 0
         var hi = currentLines.size - 1
@@ -249,6 +250,19 @@ class LyricsService : Service() {
         fun setFloatingLocked(locked: Boolean) {
             AppConfig.floatingLocked = locked
             instance?.floatingView?.setLocked(locked)
+        }
+
+        /** 手动刷新：清当前曲缓存并重新获取歌词（主界面「重新获取」入口） */
+        fun refreshLyrics(context: Context): Boolean {
+            val svc = instance ?: return false
+            val state = PlaybackBus.currentState ?: return false
+            svc.repository.evict(state.title, state.artist)
+            svc.mainHandler.post {
+                svc.currentLines = emptyList()
+                lastSource = null
+                svc.fetchLyrics(state)
+            }
+            return true
         }
 
         fun start(context: Context) {
