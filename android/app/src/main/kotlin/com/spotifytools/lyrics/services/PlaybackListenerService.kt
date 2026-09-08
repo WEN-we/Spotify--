@@ -58,6 +58,7 @@ class PlaybackListenerService : NotificationListenerService() {
             LogKit.i("Spotify MediaSession 已销毁，等待重绑")
             boundController?.unregisterCallback(this)
             boundController = null
+            spotifyBound = false
             PlaybackBus.publish(null)
             // 立即尝试重绑（session 列表监听器也会兜底触发）
             bindSpotifySession()
@@ -66,12 +67,15 @@ class PlaybackListenerService : NotificationListenerService() {
 
     override fun onListenerConnected() {
         LogKit.i("通知监听已连接，绑定 Spotify MediaSession")
+        listenerConnected = true
         registerSessionListListener()
         bindSpotifySession()
         startPolling()
     }
 
     override fun onListenerDisconnected() {
+        LogKit.w("通知监听已断开（系统回收/权限变更），等待重绑")
+        listenerConnected = false
         stopPolling()
         unbindAll()
     }
@@ -112,6 +116,7 @@ class PlaybackListenerService : NotificationListenerService() {
 
             if (spotify == null) {
                 LogKit.d("未发现活跃 Spotify MediaSession（等待播放）")
+                spotifyBound = false
                 return
             }
 
@@ -126,6 +131,7 @@ class PlaybackListenerService : NotificationListenerService() {
             boundController?.unregisterCallback(sessionCallback)
             boundController = spotify.also {
                 it.registerCallback(sessionCallback)
+                spotifyBound = true
                 LogKit.i("已绑定 Spotify MediaSession")
                 publishState()
             }
@@ -136,6 +142,7 @@ class PlaybackListenerService : NotificationListenerService() {
 
     private fun publishState() {
         val controller = boundController ?: return
+        lastPlaybackEventAt = SystemClock.elapsedRealtime()
         val metadata = controller.metadata ?: run {
             // metadata 为空（session 瞬时失效）：不在此重绑（会与 bindSpotifySession
             // 的同 token 分支互相递归），由 2s 轮询对账兜底
@@ -175,6 +182,7 @@ class PlaybackListenerService : NotificationListenerService() {
         sessionListListener = null
         boundController?.unregisterCallback(sessionCallback)
         boundController = null
+        spotifyBound = false
         PlaybackBus.publish(null)
     }
 
@@ -193,5 +201,22 @@ class PlaybackListenerService : NotificationListenerService() {
     companion object {
         const val SPOTIFY_PACKAGE = "com.spotify.music"
         private const val POLL_MS = 2000L
+
+        // ── 同步诊断状态（主界面「同步诊断」卡片实时读取） ──
+
+        /** 通知监听服务是否已连接（系统授权 + 服务存活） */
+        @Volatile
+        var listenerConnected: Boolean = false
+            private set
+
+        /** 是否已绑定 Spotify MediaSession（拿到精确元数据与进度） */
+        @Volatile
+        var spotifyBound: Boolean = false
+            private set
+
+        /** 最近一次收到播放状态的时间（elapsedRealtime；0 = 从未收到） */
+        @Volatile
+        var lastPlaybackEventAt: Long = 0L
+            private set
     }
 }

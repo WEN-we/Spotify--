@@ -13,8 +13,8 @@ android {
         applicationId = "com.spotifytools.lyrics"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.2.0"
+        versionCode = 5
+        versionName = "1.2.1"
     }
 
     // Release 用 debug 密钥签名（个人开源工具，便于直接分发；如需正式签名请替换）

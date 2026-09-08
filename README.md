@@ -14,6 +14,7 @@
 ### Windows 端
 - **t2s-converter 扩展**：基于 opencc-js + MutationObserver，实时将 Spotify 界面繁体文本转换为简体
 - **QQ音乐歌词源**：为 lyrics-plus 新增 QQ 音乐 Provider，补齐中文歌词覆盖
+- **搜索抗封锁**：qqProxy 内部四链路降级（缓存 → musicu.fcg 桌面端点 → smartbox），搜索接口被封锁时客户端零改动自动切换
 - **LRCLIB 模糊搜索**：精确匹配失败后自动降级模糊搜索
 - **本地 CORS 代理**：解决 Spotify CEF 环境下 QQ 音乐 API 的跨域限制
 

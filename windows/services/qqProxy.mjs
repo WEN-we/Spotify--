@@ -4,7 +4,7 @@
  * 背景：Spotify CEF 内的 fetch 受 CORS 约束，c.y.qq.com 不返回 Access-Control-Allow-Origin；
  *      且 CEF 对部分请求形态存在拦截（诊断中），故提供多种端点形态供判别与使用。
  * 端点：
- *   GET /search?q=<关键词>        → client_search_cp 搜索（query 式）
+ *   GET /search?q=<关键词>        → client_search_cp 搜索（query 式；封锁时内部降级 musicu.fcg）
  *   GET /s/<base64url关键词>      → 同上（路径式，无 query）
  *   GET /sb?q=<关键词>            → smartbox 搜索建议（搜索接口被封锁时的稳定替代）
  *   GET /lyric/<songid>           → fcg_query_lyric_new 歌词（路径式）
@@ -68,6 +68,8 @@ function pruneCache() {
 const SEARCH_TARGET = 'https://c.y.qq.com/soso/fcgi-bin/client_search_cp';
 const SMARTBOX_TARGET = 'https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg';
 const LYRIC_TARGET = 'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg';
+/** musicu.fcg 桌面客户端搜索端点（/search 与 /s 的内部降级链第二环，2026-09 搜索封锁期可用） */
+const MUSICU_TARGET = 'https://u.y.qq.com/cgi-bin/musicu.fcg';
 const LEGACY_ALLOWED_PREFIXES = [SEARCH_TARGET, SMARTBOX_TARGET, LYRIC_TARGET];
 
 const UPSTREAM_HEADERS = {
@@ -138,7 +140,7 @@ function resolveTarget(pathname, searchParams) {
   if (pathMatch) {
     const keyword = decodeBase64Url(pathMatch[1]);
     if (!keyword) return null;
-    return { target: `${SEARCH_TARGET}?format=json&n=10&w=${encodeURIComponent(keyword)}` };
+    return { target: `${SEARCH_TARGET}?format=json&n=10&w=${encodeURIComponent(keyword)}`, searchQuery: keyword };
   }
   // query 式搜索：/search?q=
   if (pathname === '/search') {
@@ -146,7 +148,7 @@ function resolveTarget(pathname, searchParams) {
     if (!q) return null;
     const n = Number.parseInt(searchParams.get('n') ?? '10', 10);
     const count = Number.isFinite(n) && n > 0 && n <= 30 ? n : 10;
-    return { target: `${SEARCH_TARGET}?format=json&n=${count}&w=${encodeURIComponent(q)}` };
+    return { target: `${SEARCH_TARGET}?format=json&n=${count}&w=${encodeURIComponent(q)}`, searchQuery: q };
   }
   // smartbox 搜索建议：/sb?q=（搜索接口被封锁时的稳定替代）
   if (pathname === '/sb') {
@@ -165,6 +167,44 @@ function resolveTarget(pathname, searchParams) {
     return { target: legacy };
   }
   return null;
+}
+
+/** musicu.fcg 桌面端搜索（POST JSON），响应转经典 client_search_cp 格式；
+ *  成功且非空返回经典格式 body，失败（频控/解析/空结果）返回 null —— 调用方保持原上游错误 */
+async function searchViaMusicu(query) {
+  const payload = JSON.stringify({
+    req_1: {
+      method: 'DoSearchForQQMusicDesktop',
+      module: 'music.search.SearchCgiService',
+      param: { search_type: 0, query, page_num: 1, num_per_page: 10 },
+    },
+  });
+  try {
+    const res = await fetch(MUSICU_TARGET, {
+      method: 'POST',
+      headers: { ...UPSTREAM_HEADERS, 'Content-Type': 'application/json' },
+      body: payload,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status !== 200) return null;
+    const root = JSON.parse(await res.text());
+    // 频控返回 HTTP 200 + {"code":500001,...}；非 0 一律视为失败
+    if ((root?.code ?? 0) !== 0) return null;
+    const list = root?.req_1?.data?.body?.song?.list;
+    if (!Array.isArray(list)) return null;
+    const songs = list
+      .map((o) => ({
+        songid: o.songid ?? o.id,
+        songname: o.songname ?? o.name,
+        interval: o.interval ?? 0,
+        singer: Array.isArray(o.singer) ? o.singer : [],
+      }))
+      .filter((s) => Number(s.songid) > 0 && s.songname);
+    if (!songs.length) return null;
+    return JSON.stringify({ data: { song: { list: songs } } });
+  } catch {
+    return null;
+  }
 }
 
 const server = createServer(async (req, res) => {
@@ -226,8 +266,20 @@ const server = createServer(async (req, res) => {
     }
 
     // 2. 缓存缺失/过期 → 请求上游
-    const upstream = await fetch(resolved.target, { headers: UPSTREAM_HEADERS });
-    const body = await upstream.text();
+    let upstream = await fetch(resolved.target, { headers: UPSTREAM_HEADERS });
+    let body = await upstream.text();
+
+    // 2-降级. 搜索端点上游失败（搜索接口封锁 500/空响应）→ 内部尝试 musicu.fcg 桌面端点，
+    //    响应转经典格式后对客户端透明（Windows CEF 与 Android 均按经典格式解析，零改动受益）
+    let fromMusicu = false;
+    if (resolved.searchQuery && (upstream.status !== 200 || !body)) {
+      const classic = await searchViaMusicu(resolved.searchQuery);
+      if (classic) {
+        upstream = { status: 200, headers: { get: () => 'application/json' } };
+        body = classic;
+        fromMusicu = true;
+      }
+    }
 
     // 2a. 成功 → 更新缓存（歌词仅缓存有内容的响应，避免锁死"无歌词"结果）
     if (upstream.status === 200 && body) {
@@ -241,7 +293,7 @@ const server = createServer(async (req, res) => {
         pruneCache();
         saveCache();
       }
-      accessLog(`GET ${req.url} → 200(store) len=${body.length} origin=${origin ?? '-'}`);
+      accessLog(`GET ${req.url} → 200(store${fromMusicu ? ' via=musicu' : ''}) len=${body.length} origin=${origin ?? '-'}`);
       res.writeHead(200, {
         ...corsHeaders(origin),
         'Content-Type': upstream.headers.get('content-type') ?? 'application/json',

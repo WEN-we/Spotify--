@@ -1,6 +1,7 @@
 package com.spotifytools.lyrics.ui
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -11,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
@@ -25,6 +27,7 @@ import com.spotifytools.lyrics.config.AppConfig
 import com.spotifytools.lyrics.services.LyricsCache
 import com.spotifytools.lyrics.services.LyricsService
 import com.spotifytools.lyrics.services.PlaybackBus
+import com.spotifytools.lyrics.services.PlaybackListenerService
 
 /**
  * 主界面：卡片式控制中心
@@ -45,6 +48,9 @@ class MainActivity : Activity() {
     private lateinit var offsetValue: TextView
     private lateinit var proxyState: TextView
     private lateinit var proxyInput: EditText
+    private lateinit var diagListener: TextView
+    private lateinit var diagSession: TextView
+    private lateinit var diagEvent: TextView
     private lateinit var cacheCount: TextView
     private var playbackObserver: ((PlaybackBus.State?) -> Unit)? = null
 
@@ -65,6 +71,7 @@ class MainActivity : Activity() {
         refreshBadges()
         refreshCacheCount()
         observePlayback()
+        mainHandler.post(diagRefresher)   // 同步诊断每秒刷新；onPause 统一移除
     }
 
     override fun onPause() {
@@ -139,6 +146,35 @@ class MainActivity : Activity() {
             addView(nowSource)
         }
         page.addView(nowCard, cardParams())
+
+        // ── 同步诊断卡片（定位「没同步到 Spotify」断在哪一层） ──
+        val diagCard = card().apply {
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = "同步诊断"
+                    textSize = 16f
+                    setTextColor(Color.WHITE)
+                    setPadding(0, 0, 0, 12)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                addView(smallButton("重新连接") { reconnectListener() })
+            })
+            diagListener = TextView(this@MainActivity).apply { textSize = 14f; setPadding(0, 4, 0, 4) }
+            addView(diagListener)
+            diagSession = TextView(this@MainActivity).apply { textSize = 14f; setPadding(0, 4, 0, 4) }
+            addView(diagSession)
+            diagEvent = TextView(this@MainActivity).apply { textSize = 14f; setPadding(0, 4, 0, 4) }
+            addView(diagEvent)
+            addView(TextView(this@MainActivity).apply {
+                text = "「通知监听」未连接时：去系统设置把「通知使用权」关闭再重新开启；MIUI/国产系统还需允许本应用自启动与后台运行"
+                textSize = 12f
+                setTextColor(gray)
+                setPadding(0, 10, 0, 0)
+            })
+        }
+        page.addView(diagCard, cardParams())
 
         // ── 设置卡片 ──
         val settingCard = card().apply {
@@ -475,6 +511,66 @@ class MainActivity : Activity() {
                 ).show()
             }
         }.start()
+    }
+
+    // ── 同步诊断 ──
+
+    private val diagRefresher = object : Runnable {
+        override fun run() {
+            updateDiag()
+            mainHandler.postDelayed(this, 1000)
+        }
+    }
+
+    /** 逐层显示同步链路状态：系统监听连接 → Spotify 会话绑定 → 最近播放事件 */
+    private fun updateDiag() {
+        val connected = PlaybackListenerService.listenerConnected
+        val bound = PlaybackListenerService.spotifyBound
+        val elapsed = PlaybackListenerService.lastPlaybackEventAt
+
+        diagListener.text = when {
+            !notificationListenerGranted() -> "通知监听：✗ 未授权"
+            connected -> "通知监听：✓ 已连接"
+            else -> "通知监听：✗ 未连接（点「重新连接」或重开通知使用权）"
+        }
+        diagListener.setTextColor(
+            when {
+                !notificationListenerGranted() || !connected -> orange
+                else -> green
+            }
+        )
+
+        diagSession.text = when {
+            bound -> "Spotify 会话：✓ 已绑定（可获取播放进度）"
+            connected -> "Spotify 会话：等待 Spotify 播放（打开 Spotify 播放任意歌曲）"
+            else -> "Spotify 会话：—（依赖通知监听连接）"
+        }
+        diagSession.setTextColor(if (bound) green else gray)
+
+        diagEvent.text = when {
+            elapsed == 0L -> "最近播放事件：暂无"
+            else -> {
+                val sec = (android.os.SystemClock.elapsedRealtime() - elapsed) / 1000
+                "最近播放事件：$sec 秒前" + if (sec > 10) "（长时间无更新，可能 Spotify 在后台被系统限制）" else ""
+            }
+        }
+        diagEvent.setTextColor(if (elapsed == 0L) gray else green)
+    }
+
+    /** 手动请求系统重连通知监听（官方 API，APK 更新后 MIUI 不自动重绑的补救） */
+    private fun reconnectListener() {
+        if (!notificationListenerGranted()) {
+            Toast.makeText(this, "请先授予「通知使用权」", Toast.LENGTH_SHORT).show()
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            return
+        }
+        try {
+            val cn = ComponentName(this, PlaybackListenerService::class.java)
+            NotificationListenerService.requestRebind(cn)
+            Toast.makeText(this, "已请求系统重连监听，几秒后自动生效", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "重连请求失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
     }
 
     // ── 状态刷新 ──
