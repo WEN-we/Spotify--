@@ -5,6 +5,8 @@ import android.content.Context
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -16,10 +18,11 @@ import com.spotifytools.lyrics.utils.LogKit
  * 机制：NotificationListenerService 授权后，通过 [MediaSessionManager.getActiveSessions]
  *      获取活跃 MediaSession（精确元数据 + 进度）。
  *
- * 重绑可靠性（三层保障，解决 Spotify MediaSession 销毁重建后失联）：
+ * 重绑可靠性（四层保障，解决 Spotify MediaSession 销毁重建后失联/事件丢失）：
  *  1. OnActiveSessionsChangedListener —— session 列表变化即重绑（主通道）
- *  2. onNotificationPosted —— Spotify 通知出现时兜底重绑
+ *  2. onNotificationPosted —— Spotify 通知出现时对账重绑
  *  3. onListenerConnected —— 服务连接时立即绑定
+ *  4. 轮询兜底（2s）—— 即使上述回调全部丢失，轮询强制对账 + 重新发布最新状态
  *
  * 降级：权限未授予时服务不连接（系统行为），App 内引导授权。
  * 规则：仅监听媒体会话；Spotify session 消失时发布 null（停止歌词）。
@@ -28,6 +31,19 @@ class PlaybackListenerService : NotificationListenerService() {
 
     private var boundController: MediaController? = null
     private var sessionListListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
+
+    // 轮询兜底：回调可能丢失（Spotify session 重建、厂商系统事件裁剪），
+    // 每 2s 强制对账一次，保证最终同步。本地 binder 调用，开销可忽略。
+    private val pollHandler = Handler(Looper.getMainLooper())
+    private var polling = false
+    private val pollTask = object : Runnable {
+        override fun run() {
+            try {
+                bindSpotifySession()
+            } catch (_: Exception) { /* 下轮再试 */ }
+            pollHandler.postDelayed(this, POLL_MS)
+        }
+    }
 
     private val sessionCallback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: android.media.MediaMetadata?) {
@@ -52,15 +68,17 @@ class PlaybackListenerService : NotificationListenerService() {
         LogKit.i("通知监听已连接，绑定 Spotify MediaSession")
         registerSessionListListener()
         bindSpotifySession()
+        startPolling()
     }
 
     override fun onListenerDisconnected() {
+        stopPolling()
         unbindAll()
     }
 
-    /** 通知变化兜底：Spotify 通知出现时若无绑定则尝试重绑 */
+    /** 通知变化兜底：Spotify 通知出现时对账（幂等，同 token 跳过并仅刷新状态） */
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn?.packageName == SPOTIFY_PACKAGE && boundController == null) {
+        if (sbn?.packageName == SPOTIFY_PACKAGE) {
             bindSpotifySession()
         }
     }
@@ -119,8 +137,9 @@ class PlaybackListenerService : NotificationListenerService() {
     private fun publishState() {
         val controller = boundController ?: return
         val metadata = controller.metadata ?: run {
-            // metadata 为空：session 失效，尝试重绑
-            bindSpotifySession()
+            // metadata 为空（session 瞬时失效）：不在此重绑（会与 bindSpotifySession
+            // 的同 token 分支互相递归），由 2s 轮询对账兜底
+            LogKit.d("metadata 为空，等待轮询对账")
             return
         }
         val title = metadata.getString(android.media.MediaMetadata.METADATA_KEY_TITLE) ?: return
@@ -159,7 +178,20 @@ class PlaybackListenerService : NotificationListenerService() {
         PlaybackBus.publish(null)
     }
 
+    private fun startPolling() {
+        if (polling) return
+        polling = true
+        pollHandler.post(pollTask)
+        LogKit.i("轮询兜底已启动（${POLL_MS / 1000}s）")
+    }
+
+    private fun stopPolling() {
+        polling = false
+        pollHandler.removeCallbacks(pollTask)
+    }
+
     companion object {
         const val SPOTIFY_PACKAGE = "com.spotify.music"
+        private const val POLL_MS = 2000L
     }
 }

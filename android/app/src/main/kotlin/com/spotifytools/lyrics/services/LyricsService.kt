@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import com.spotifytools.lyrics.modules.FloatingLyricsView
 import com.spotifytools.lyrics.ui.MainActivity
@@ -39,6 +40,11 @@ class LyricsService : Service() {
     private var currentTrackId: String? = null
     private var currentLines: List<LyricRepository.LrcLine> = emptyList()
     private var currentPlayback: PlaybackBus.State? = null
+
+    // 歌词重试：fetch 失败（网络瞬断等）后不重试会导致整首歌空白，
+    // 轮询状态发布时按间隔自动重试（RETRY_MS 内不重复）
+    private var fetching = false
+    private var lastFetchFailAt = 0L
 
     // 歌词滚动定时器（500ms）
     private val ticker = object : Runnable {
@@ -106,6 +112,11 @@ class LyricsService : Service() {
             currentLines = emptyList()
             lastSource = null
             fetchLyrics(state)
+        } else if (currentLines.isEmpty() && !fetching && state.isPlaying &&
+            SystemClock.elapsedRealtime() - lastFetchFailAt > RETRY_MS
+        ) {
+            // 同曲目但无歌词且此前失败：自动重试（轮询状态发布触发，RETRY_MS 节流）
+            fetchLyrics(state)
         }
 
         // 播放/暂停切换定时器
@@ -115,12 +126,14 @@ class LyricsService : Service() {
 
     private fun fetchLyrics(state: PlaybackBus.State) {
         // 歌词获取不依赖悬浮窗（无悬浮窗权限时主界面仍显示来源/状态）
+        fetching = true
         floatingView?.showHint("正在获取歌词…")
         repository.fetchAsync(
             trackName = state.title,
             artistName = state.artist,
             durationMs = state.durationMs,
         ) { result ->
+            fetching = false
             // 回调时可能已切歌：校验 trackId
             if (state.trackId != currentTrackId) return@fetchAsync
             result
@@ -132,6 +145,11 @@ class LyricsService : Service() {
                 .onFailure { err ->
                     currentLines = emptyList()
                     lastSource = null
+                    // 网络类失败记录时间，RETRY_MS 后由轮询状态触发自动重试；
+                    // NO_RESULT（曲库确认无此歌）不重试，避免无效请求
+                    if (err.code != AppError.CODE_NO_RESULT) {
+                        lastFetchFailAt = SystemClock.elapsedRealtime()
+                    }
                     floatingView?.showHint(when (err.code) {
                         AppError.CODE_NO_RESULT -> "未找到歌词"
                         AppError.CODE_NETWORK -> "网络不可用"
@@ -216,6 +234,7 @@ class LyricsService : Service() {
     companion object {
         private const val NOTIFICATION_ID = 1001
         private const val TICK_MS = 500L
+        private const val RETRY_MS = 20_000L   // 歌词获取失败后的重试间隔
 
         /** 最近一次歌词来源（主界面展示用；null = 未获取/失败） */
         @Volatile
