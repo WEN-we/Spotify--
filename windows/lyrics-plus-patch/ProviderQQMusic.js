@@ -9,8 +9,10 @@
  */
 const ProviderQQMusic = (() => {
 	const PROXY_SEARCH = "http://127.0.0.1:39871/search?q=";
+	const PROXY_SB = "http://127.0.0.1:39871/sb?q=";
 	const PROXY_LYRIC = "http://127.0.0.1:39871/lyric/";
 	const SEARCH_API = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?format=json&n=10&w=";
+	const SB_API = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?key=";
 	const LYRIC_API = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?format=json&nobase64=1&musicid=";
 
 	/** 调试埋点：写入 localStorage（保留最新 20 条），供外部诊断 CEF 内真实行为 */
@@ -91,20 +93,63 @@ const ProviderQQMusic = (() => {
 
 		const query = `${cleanTitle} ${firstArtist(info.artist)}`.trim();
 		debugLog("search-start", `${query} | dur=${info.duration}ms | raw=${info.title}`);
-		const searchResults = await qqGet(PROXY_SEARCH + encodeURIComponent(query), SEARCH_API + encodeURIComponent(query));
-		const items = searchResults?.data?.song?.list;
+
+		// 主搜索（client_search_cp）：失败/无结果不直接抛——继续 smartbox 回退
+		let items = null;
+		try {
+			const searchResults = await qqGet(PROXY_SEARCH + encodeURIComponent(query), SEARCH_API + encodeURIComponent(query));
+			items = searchResults?.data?.song?.list;
+		} catch (e) {
+			debugLog("search-fail", String(e?.message ?? e).slice(0, 100));
+		}
 		debugLog("search-result", `count=${items?.length ?? 0}`);
+
+		// 主搜索无结果/失败（接口被封锁 500/空）：smartbox 搜索建议回退——
+		// 返回 歌名/完整歌手/songid(docid)，无时长字段（匹配走「歌名+歌手」规则）
+		if (!items?.length) {
+			try {
+				const sb = await qqGet(PROXY_SB + encodeURIComponent(query), SB_API + encodeURIComponent(query) + "&format=json");
+				items = (sb?.data?.song?.itemlist ?? []).map((it) => ({
+					songname: it.name,
+					singer: [{ name: it.singer }],
+					interval: 0,
+					songid: Number(it.docid),
+				}));
+				debugLog("smartbox-result", `count=${items.length}`);
+			} catch (e) {
+				debugLog("smartbox-fail", String(e?.message ?? e).slice(0, 100));
+			}
+		}
 		if (!items?.length) throw "Cannot find track";
 
-		// 匹配策略（歌名比较统一归一化为简体，兼容繁体元数据）
-		const simpTitle = normalizeToSimplified(cleanTitle);
-		const nameOf = (val) => normalizeToSimplified(val?.songname ?? "");
+		// 匹配策略（歌手感知，v2）：歌名相等（大小写/繁简不敏感）为主，
+		// 歌手兼容（双向包含）为约束，时长接近为辅助；禁止纯时长匹配
+		// （曾致英文歌「Give up」匹配到同时长/同名不同歌手的中文歌）
+		const simpTitle = normalizeToSimplified(cleanTitle).trim().toLowerCase();
+		const wantArtist = normalizeToSimplified(firstArtist(info.artist)).trim().toLowerCase();
+		const nameOf = (val) => normalizeToSimplified(val?.songname ?? "").trim().toLowerCase();
+		const singerOf = (val) => normalizeToSimplified(val?.singer?.[0]?.name ?? "").trim();
+		const nameEq = (val) => nameOf(val) === simpTitle;
+		const nameSimilar = (val) => {
+			const n = nameOf(val);
+			return n.length >= 2 && simpTitle.length >= 2 && (n.includes(simpTitle) || simpTitle.includes(n));
+		};
+		const artistOk = (val) => {
+			const singer = singerOf(val);
+			if (!singer || !wantArtist) return true; // 候选歌手未知（种子缓存）或本地歌手为空
+			return singer.split(/[\/，,、;]/)
+				.map((p) => normalizeToSimplified(p).trim().toLowerCase())
+				.some((p) => p && (p.includes(wantArtist) || wantArtist.includes(p)));
+		};
 		const durationDiff = (val) => Math.abs(info.duration - (val?.interval ?? 0) * 1000);
-		let itemId = items.findIndex((val) => nameOf(val) === simpTitle && durationDiff(val) < 3000);
-		if (itemId === -1) itemId = items.findIndex((val) => durationDiff(val) < 3000);
-		if (itemId === -1) itemId = items.findIndex((val) => nameOf(val) === simpTitle);
+		const durClose = (val) => info.duration > 0 && (val?.interval ?? 0) > 0 && durationDiff(val) < 3000;
+		const durUnknown = (val) => (val?.interval ?? 0) <= 0;
+		let itemId = items.findIndex((val) => nameEq(val) && durClose(val) && artistOk(val));
+		if (itemId === -1) itemId = items.findIndex((val) => nameEq(val) && durUnknown(val) && artistOk(val));
+		if (itemId === -1) itemId = items.findIndex((val) => nameEq(val) && artistOk(val));
+		if (itemId === -1) itemId = items.findIndex((val) => nameSimilar(val) && durClose(val) && artistOk(val));
 		if (itemId === -1) {
-			debugLog("match-fail", `target="${simpTitle}" candidates=${items.map((v) => `${v.songname}/${v.singer?.[0]?.name}/${v.interval}s`).join("; ").slice(0, 200)}`);
+			debugLog("match-fail", `target="${simpTitle}/${wantArtist}" candidates=${items.map((v) => `${v.songname}/${v.singer?.[0]?.name}/${v.interval}s`).join("; ").slice(0, 200)}`);
 			throw "Cannot find track";
 		}
 		debugLog("match-hit", `#${itemId} ${items[itemId].songname} / ${items[itemId].singer?.[0]?.name}`);

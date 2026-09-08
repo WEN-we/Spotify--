@@ -13,8 +13,8 @@ android {
         applicationId = "com.spotifytools.lyrics"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.2.0"
     }
 
     // Release 用 debug 密钥签名（个人开源工具，便于直接分发；如需正式签名请替换）
@@ -50,4 +50,6 @@ dependencies {
     // 零第三方运行时依赖：HTTP 用 HttpURLConnection，JSON 用 org.json（系统内置）
     testImplementation(kotlin("test"))
     testImplementation("junit:junit:4.13.2")
+    // 单元测试用真实 org.json（Android android.jar 中的是抛异常的桩；仅测试类路径，不影响运行时零依赖）
+    testImplementation("org.json:json:20231013")
 }

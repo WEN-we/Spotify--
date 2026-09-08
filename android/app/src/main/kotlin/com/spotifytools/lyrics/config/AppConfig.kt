@@ -17,6 +17,7 @@ object AppConfig {
     const val KEY_FONT_SIZE = "font_size"                          // 歌词字号
     const val KEY_LOCKED = "floating_locked"                       // 悬浮窗锁定（触摸穿透）
     const val KEY_LRCLIB_BASE = "lrclib_base"                      // LRCLIB 地址（可换源）
+    const val KEY_QQ_PROXY_BASE = "qq_proxy_base"                  // Windows qqProxy 局域网地址（空 = 直连）
     const val KEY_DEBUG_LOG = "debug_log"                          // 调试日志
 
     // 默认值（集中声明，不散落各处）
@@ -60,6 +61,15 @@ object AppConfig {
     var lrclibBase: String
         get() = prefs.getString(KEY_LRCLIB_BASE, DEFAULT_LRCLIB_BASE) ?: DEFAULT_LRCLIB_BASE
         set(value) = prefs.edit().putString(KEY_LRCLIB_BASE, value).apply()
+
+    /**
+     * Windows qqProxy 局域网地址（如 http://192.168.5.8:39871）
+     * 非空 = QQ 音乐搜索/歌词优先走电脑代理（复用其持久缓存，规避搜索接口 IP 频控）；
+     * 代理不可达时自动降级直连。空 = 直连。
+     */
+    var qqProxyBase: String
+        get() = (prefs.getString(KEY_QQ_PROXY_BASE, "") ?: "").trim().trimEnd('/')
+        set(value) = prefs.edit().putString(KEY_QQ_PROXY_BASE, value.trim().trimEnd('/')).apply()
 
     var debugLog: Boolean
         get() = prefs.getBoolean(KEY_DEBUG_LOG, false)

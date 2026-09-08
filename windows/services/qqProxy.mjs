@@ -6,16 +6,19 @@
  * 端点：
  *   GET /search?q=<关键词>        → client_search_cp 搜索（query 式）
  *   GET /s/<base64url关键词>      → 同上（路径式，无 query）
+ *   GET /sb?q=<关键词>            → smartbox 搜索建议（搜索接口被封锁时的稳定替代）
  *   GET /lyric/<songid>           → fcg_query_lyric_new 歌词（路径式）
  *   GET /ping200                  → 静态 200 JSON（判别用，不转发）
  *   GET /?url=<完整URL>            → 旧接口（外部 curl 调试）
  * 缓存：搜索/歌词结果持久化到 qq-proxy-cache.json（搜索 7 天 / 歌词 30 天），
  *      上游失败（如搜索接口被频控 500）时降级返回过期缓存——重播歌曲零上游请求。
- * 安全：仅监听本机回环；仅允许转发到 c.y.qq.com 白名单路径。
+ * 安全：监听 0.0.0.0（局域网可达，供 Android 端复用缓存规避搜索接口频控）；
+ *      仅允许转发到 c.y.qq.com 白名单路径（防 SSRF），无写操作。
  * 日志：请求流水写入 qq-proxy-access.log（供外部诊断 CEF 请求是否到达）。
  */
 import { createServer } from 'node:http';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../utils/logger.js';
 
@@ -63,8 +66,9 @@ function pruneCache() {
 
 /** QQ 音乐上游固定端点（白名单，防 SSRF） */
 const SEARCH_TARGET = 'https://c.y.qq.com/soso/fcgi-bin/client_search_cp';
+const SMARTBOX_TARGET = 'https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg';
 const LYRIC_TARGET = 'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg';
-const LEGACY_ALLOWED_PREFIXES = [SEARCH_TARGET, LYRIC_TARGET];
+const LEGACY_ALLOWED_PREFIXES = [SEARCH_TARGET, SMARTBOX_TARGET, LYRIC_TARGET];
 
 const UPSTREAM_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:93.0) Gecko/20100101 Firefox/93.0',
@@ -143,6 +147,12 @@ function resolveTarget(pathname, searchParams) {
     const n = Number.parseInt(searchParams.get('n') ?? '10', 10);
     const count = Number.isFinite(n) && n > 0 && n <= 30 ? n : 10;
     return { target: `${SEARCH_TARGET}?format=json&n=${count}&w=${encodeURIComponent(q)}` };
+  }
+  // smartbox 搜索建议：/sb?q=（搜索接口被封锁时的稳定替代）
+  if (pathname === '/sb') {
+    const q = searchParams.get('q');
+    if (!q) return null;
+    return { target: `${SMARTBOX_TARGET}?key=${encodeURIComponent(q)}&format=json` };
   }
   // 路径式歌词：/lyric/<songid>
   const lyricMatch = pathname.match(/^\/lyric\/(\d{1,20})$/);
@@ -279,9 +289,18 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  accessLog(`=== 代理启动 :${PORT}（/s/<b64> /search?q= /lyric/<id> /ping200）===`);
-  logger.info(`QQ 音乐 CORS 代理已启动: http://127.0.0.1:${PORT}`);
+/** 局域网 IPv4 列表（供 Android 端配置代理地址） */
+function lanAddresses() {
+  return Object.values(networkInterfaces())
+    .flat()
+    .filter((ni) => ni && ni.family === 'IPv4' && !ni.internal)
+    .map((ni) => ni.address);
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+  const lans = lanAddresses();
+  accessLog(`=== 代理启动 0.0.0.0:${PORT}（/s/<b64> /search?q= /lyric/<id> /ping200）===`);
+  logger.info(`QQ 音乐 CORS 代理已启动: http://127.0.0.1:${PORT}（局域网: ${lans.map((ip) => `http://${ip}:${PORT}`).join(', ') || '未检测到'}）`);
 });
 
 process.on('SIGINT', () => process.exit(0));

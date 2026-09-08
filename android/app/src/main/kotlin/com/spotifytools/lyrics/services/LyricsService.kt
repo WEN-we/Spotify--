@@ -63,6 +63,7 @@ class LyricsService : Service() {
     override fun onCreate() {
         super.onCreate()
         repository = LyricRepository(this)
+        instance = this
         startForeground(NOTIFICATION_ID, buildNotification())
         ensureFloatingView()
         PlaybackBus.observe(playbackObserver)

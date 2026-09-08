@@ -14,6 +14,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -42,8 +43,9 @@ class MainActivity : Activity() {
     private lateinit var nowSource: TextView
     private lateinit var fontSizeValue: TextView
     private lateinit var offsetValue: TextView
+    private lateinit var proxyState: TextView
+    private lateinit var proxyInput: EditText
     private lateinit var cacheCount: TextView
-    private lateinit var permContainer: LinearLayout
     private var playbackObserver: ((PlaybackBus.State?) -> Unit)? = null
 
     // ── 主题色 ──
@@ -221,6 +223,62 @@ class MainActivity : Activity() {
                 addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
                 addView(smallButton("重置") { adjustOffset(-AppConfig.lyricOffsetMs) })
             })
+
+            // 歌词代理：QQ音乐搜索接口频控时，同 WiFi 走电脑 qqProxy 缓存（电脑需运行代理）
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 20, 0, 4)
+                addView(TextView(this@MainActivity).apply {
+                    text = "歌词代理"
+                    textSize = 16f
+                    setTextColor(Color.WHITE)
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                proxyState = TextView(this@MainActivity).apply {
+                    textSize = 14f
+                }
+                addView(proxyState)
+                updateProxyState()
+            })
+            proxyInput = EditText(this@MainActivity).apply {
+                hint = "http://192.168.x.x:39871（留空 = 直连）"
+                textSize = 14f
+                setTextColor(Color.WHITE)
+                setHintTextColor(gray)
+                setText(AppConfig.qqProxyBase)
+                inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#232326"))
+                    cornerRadius = 24f
+                }
+                setPadding(24, 18, 24, 18)
+            }
+            addView(proxyInput)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 8, 0, 0)
+                addView(smallButton("保存") {
+                    AppConfig.qqProxyBase = proxyInput.text.toString()
+                    updateProxyState()
+                    if (AppConfig.qqProxyBase.isNotEmpty()) testProxy()
+                    else Toast.makeText(this@MainActivity, "已改为直连", Toast.LENGTH_SHORT).show()
+                })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("测试") { testProxy() })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("清空") {
+                    AppConfig.qqProxyBase = ""
+                    proxyInput.setText("")
+                    updateProxyState()
+                })
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "QQ音乐搜索接口频控时，手机与电脑同 WiFi 可走电脑代理缓存获取歌词（电脑端 qqProxy 需运行）"
+                textSize = 12f
+                setTextColor(gray)
+                setPadding(0, 10, 0, 0)
+            })
         }
         page.addView(settingCard, cardParams())
 
@@ -382,6 +440,43 @@ class MainActivity : Activity() {
         }
     }
 
+    // ── 歌词代理 ──
+
+    private fun updateProxyState() {
+        val base = AppConfig.qqProxyBase
+        proxyState.text = if (base.isEmpty()) "直连" else "已启用"
+        proxyState.setTextColor(if (base.isEmpty()) gray else green)
+    }
+
+    /** 测试代理可达性（后台线程 ping /ping200，3s 超时） */
+    private fun testProxy() {
+        val base = proxyInput.text.toString().trim().trimEnd('/')
+        if (base.isEmpty()) {
+            Toast.makeText(this, "请先输入代理地址", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Toast.makeText(this, "测试中…", Toast.LENGTH_SHORT).show()
+        Thread {
+            val ok = try {
+                val conn = java.net.URL("$base/ping200").openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 3_000
+                conn.readTimeout = 3_000
+                val code = conn.responseCode
+                conn.disconnect()
+                code == 200
+            } catch (_: Exception) {
+                false
+            }
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (ok) "代理可达 ✓" else "代理不可达（检查地址 / 电脑代理运行 / 防火墙）",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }.start()
+    }
+
     // ── 状态刷新 ──
 
     private fun refreshBadges() {
@@ -425,18 +520,23 @@ class MainActivity : Activity() {
 
     private fun observePlayback() {
         playbackObserver?.let { PlaybackBus.removeObserver(it) }
+        var shownTrackId: String? = null
         playbackObserver = { state ->
             runOnUiThread {
                 if (state == null) {
+                    shownTrackId = null
                     nowTitle.text = "等待播放…"
                     nowArtist.text = ""
                     nowSource.text = "启动 Spotify 播放歌曲后自动显示歌词"
-                } else {
+                } else if (state.trackId != shownTrackId) {
+                    // 仅切歌时重置标签并启动轮询——播放中 2s 状态发布会刷新进度，
+                    // 不能每次都重置为「正在获取」（否则已加载的来源标签反复闪烁）
+                    shownTrackId = state.trackId
                     nowTitle.text = state.title
                     nowArtist.text = state.artist
                     nowSource.text = "正在获取歌词…"
                     nowSource.setTextColor(gray)
-                    // 轮询刷新来源标签（LRCLIB→QQ 音乐回退最长需 ~16s，最多轮询 20 次）
+                    // 轮询刷新来源标签（双源并行最长 ~8s，最多轮询 20 次）
                     pollSourceLabel(state.trackId, 0)
                 }
             }

@@ -100,8 +100,18 @@ class LyricRepository(context: Context) {
             if (pending.decrementAndGet() == 0) allFailed()
         }
 
-        executor.execute { handle("LRCLIB", LrclibClient.fetch(trackName, artistName, durationSec).map { it.syncedLrc }) }
-        executor.execute { handle("QQ音乐", QqMusicClient.fetch(trackName, artistName, durationMs).map { it.syncedLrc }) }
+        // 防御：源客户端抛出未捕获异常时转为标准错误，绝不让异常杀死线程、
+        // 导致 pending 计数不归零 → allFailed 永不触发 → fetching 永久卡死
+        fun safeFetch(name: String, block: () -> Result<String>): Result<String> =
+            try {
+                block()
+            } catch (e: Exception) {
+                LogKit.e("$name 未捕获异常", e)
+                Result.Failure(AppError.parse("$name 内部异常"))
+            }
+
+        executor.execute { handle("LRCLIB", safeFetch("LRCLIB") { LrclibClient.fetch(trackName, artistName, durationSec).map { it.syncedLrc } }) }
+        executor.execute { handle("QQ音乐", safeFetch("QQ音乐") { QqMusicClient.fetch(trackName, artistName, durationMs).map { it.syncedLrc } }) }
     }
 
     /** 过滤制作人员行（作词/作曲/编曲/混音等 credits），保留纯音乐提示行 */

@@ -57,8 +57,12 @@ object LrclibClient {
             if (parsed != null) Result.Success(parsed)
             else Result.Failure(AppError.noResult("无 syncedLyrics 字段"))
         } catch (e: java.io.IOException) {
-            LogKit.d("LRCLIB get 失败: ${e.message}")
+            LogKit.d("LRCLIB get 网络失败: ${e.message}")
             Result.Failure(AppError.network("LRCLIB 请求失败"))
+        } catch (e: Exception) {
+            // JSON 解析异常等：归类 parse（跳过该源），绝不让异常穿透杀死调用线程
+            LogKit.d("LRCLIB get 解析失败: ${e.message}")
+            Result.Failure(AppError.parse("LRCLIB 响应异常"))
         }
     }
 
@@ -79,8 +83,11 @@ object LrclibClient {
             if (hit != null) Result.Success(hit)
             else Result.Failure(AppError.noResult("LRCLIB 无同步歌词结果"))
         } catch (e: java.io.IOException) {
-            LogKit.d("LRCLIB search 失败: ${e.message}")
+            LogKit.d("LRCLIB search 网络失败: ${e.message}")
             Result.Failure(AppError.network("LRCLIB 请求失败"))
+        } catch (e: Exception) {
+            LogKit.d("LRCLIB search 解析失败: ${e.message}")
+            Result.Failure(AppError.parse("LRCLIB 响应异常"))
         }
     }
 
@@ -95,16 +102,16 @@ object LrclibClient {
         )
     }
 
-    /** HTTP GET（8s 超时，User-Agent 必填——LRCLIB 要求标识客户端） */
+    /** HTTP GET（8s 超时，User-Agent 必填——LRCLIB 要求标识客户端；非 200 抛 IOException 归类网络错误） */
     private fun httpGet(urlStr: String): String {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         return try {
             conn.connectTimeout = 8_000
             conn.readTimeout = 8_000
             conn.requestMethod = "GET"
-            conn.setRequestProperty("User-Agent", "SpotifyLyrics-Android/1.0 (floating lyrics overlay)")
+            conn.setRequestProperty("User-Agent", "SpotifyLyrics-Android/1.2 (floating lyrics overlay)")
             val code = conn.responseCode
-            if (code != 200) throw RuntimeException("HTTP $code")
+            if (code != 200) throw java.io.IOException("HTTP $code")
             conn.inputStream.bufferedReader().use(BufferedReader::readText)
         } finally {
             conn.disconnect()
