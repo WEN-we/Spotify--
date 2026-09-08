@@ -160,6 +160,8 @@ class MainActivity : Activity() {
                     layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 })
                 addView(smallButton("重新连接") { reconnectListener() })
+                addView(TextView(this@MainActivity).apply { text = "  "; textSize = 1f })
+                addView(smallButton("去开自启动") { openAutoStartSettings() })
             })
             diagListener = TextView(this@MainActivity).apply { textSize = 14f; setPadding(0, 4, 0, 4) }
             addView(diagListener)
@@ -168,7 +170,7 @@ class MainActivity : Activity() {
             diagEvent = TextView(this@MainActivity).apply { textSize = 14f; setPadding(0, 4, 0, 4) }
             addView(diagEvent)
             addView(TextView(this@MainActivity).apply {
-                text = "「通知监听」未连接时：去系统设置把「通知使用权」关闭再重新开启；MIUI/国产系统还需允许本应用自启动与后台运行"
+                text = "「通知监听」未连接 = 小米「自启动」未放行（系统重绑被拒）：点「去开自启动」允许后，再点「重新连接」"
                 textSize = 12f
                 setTextColor(gray)
                 setPadding(0, 10, 0, 0)
@@ -570,6 +572,34 @@ class MainActivity : Activity() {
             Toast.makeText(this, "已请求系统重连监听，几秒后自动生效", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "重连请求失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 跳转自启动授权页。MIUI/HyperOS 的 AutoStartManagerService 会拒绝系统对
+     * 通知监听服务的重绑（日志实测 "Reject service ... PlaybackListenerService"），
+     * 必须在此页面手动允许自启动，否则「等待播放」永不恢复。
+     * 非 MIUI 或页面不存在时回退应用详情页。
+     */
+    private fun openAutoStartSettings() {
+        val miuiIntent = Intent().apply {
+            component = ComponentName(
+                "com.miui.securitycenter",
+                "com.miui.permcenter.autostart.AutoStartManagementActivity",
+            )
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(miuiIntent)
+        } catch (_: Exception) {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:$packageName"),
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (_: Exception) { /* 极端情况：无任何可跳转页 */ }
         }
     }
 
