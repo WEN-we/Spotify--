@@ -170,7 +170,7 @@ class MainActivity : Activity() {
             diagEvent = TextView(this@MainActivity).apply { textSize = 14f; setPadding(0, 4, 0, 4) }
             addView(diagEvent)
             addView(TextView(this@MainActivity).apply {
-                text = "「通知监听」未连接 = 小米「自启动」未放行（系统重绑被拒）：点「去开自启动」允许后，再点「重新连接」"
+                text = "「通知监听」未连接时最有效：系统设置 → 通知使用权 → 把本应用关闭再重新打开（小米自启动开关拦不住系统重绑，此法实测必成）"
                 textSize = 12f
                 setTextColor(gray)
                 setPadding(0, 10, 0, 0)
@@ -559,7 +559,7 @@ class MainActivity : Activity() {
         diagEvent.setTextColor(if (elapsed == 0L) gray else green)
     }
 
-    /** 手动请求系统重连通知监听（官方 API，APK 更新后 MIUI 不自动重绑的补救） */
+    /** 手动请求系统重连通知监听；3 秒后仍未连接 → 自动跳通知使用权设置页引导 关→开（HyperOS 上唯一稳定有效的办法） */
     private fun reconnectListener() {
         if (!notificationListenerGranted()) {
             Toast.makeText(this, "请先授予「通知使用权」", Toast.LENGTH_SHORT).show()
@@ -569,10 +569,18 @@ class MainActivity : Activity() {
         try {
             val cn = ComponentName(this, PlaybackListenerService::class.java)
             NotificationListenerService.requestRebind(cn)
-            Toast.makeText(this, "已请求系统重连监听，几秒后自动生效", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "已请求重连；几秒后未恢复会自动跳转设置页", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "重连请求失败: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+        mainHandler.postDelayed({
+            if (!PlaybackListenerService.listenerConnected) {
+                Toast.makeText(this, "系统未重绑（MIUI 限制）：请在设置页把通知使用权 关闭再重新打开", Toast.LENGTH_LONG).show()
+                try {
+                    startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                } catch (_: Exception) { }
+            }
+        }, 3_000)
     }
 
     /**
