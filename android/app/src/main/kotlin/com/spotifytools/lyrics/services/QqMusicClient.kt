@@ -74,7 +74,14 @@ object QqMusicClient {
 
         // 2. 歌手感知匹配（禁止纯时长匹配——防止英文歌匹配到同时长中文歌）
         val hit = matchCandidate(cands, cleanTitle, artistName, durationMs)
-            ?: throw NoSuchFieldException("无匹配歌曲（歌手/歌名/时长校验未通过）")
+            ?: run {
+                // 匹配失败：输出全部候选明细供诊断（debugLog 开启时可见）
+                LogKit.d(
+                    "QQ候选(${cands.size}): " +
+                        cands.joinToString(" | ") { "${it.name}/${it.singer}/${it.intervalSec}s" },
+                )
+                throw NoSuchFieldException("无匹配歌曲（歌手/歌名/时长校验未通过）")
+            }
         LogKit.d("QQ匹配: ${hit.name} / ${hit.singer} / ${hit.songId}")
 
         // 3. 拉取歌词（代理优先降级直连；nobase64=1 明文 LRC）
