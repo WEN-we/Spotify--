@@ -9,16 +9,57 @@
  *   GET /lyric/<songid>           → fcg_query_lyric_new 歌词（路径式）
  *   GET /ping200                  → 静态 200 JSON（判别用，不转发）
  *   GET /?url=<完整URL>            → 旧接口（外部 curl 调试）
+ * 缓存：搜索/歌词结果持久化到 qq-proxy-cache.json（搜索 7 天 / 歌词 30 天），
+ *      上游失败（如搜索接口被频控 500）时降级返回过期缓存——重播歌曲零上游请求。
  * 安全：仅监听本机回环；仅允许转发到 c.y.qq.com 白名单路径。
  * 日志：请求流水写入 qq-proxy-access.log（供外部诊断 CEF 请求是否到达）。
  */
 import { createServer } from 'node:http';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../utils/logger.js';
 
 const PORT = 39871;
 const ACCESS_LOG = fileURLToPath(new URL('./qq-proxy-access.log', import.meta.url));
+const CACHE_FILE = fileURLToPath(new URL('./qq-proxy-cache.json', import.meta.url));
+const SEARCH_TTL_MS = 7 * 24 * 3600_000;   // 搜索结果缓存 7 天
+const LYRIC_TTL_MS = 30 * 24 * 3600_000;   // 歌词缓存 30 天（同一 songid 内容不变）
+const CACHE_MAX_ENTRIES = 5000;            // 缓存条目上限（超出淘汰最旧）
+
+/** 缓存：{ [targetUrl]: { body, contentType, ts } } */
+let cache = loadCache();
+
+function loadCache() {
+  try {
+    const parsed = JSON.parse(readFileSync(CACHE_FILE, 'utf8'));
+    if (parsed && typeof parsed === 'object') return parsed;
+  } catch { /* 首次运行或损坏 → 空缓存 */ }
+  return {};
+}
+
+function saveCache() {
+  try {
+    writeFileSync(CACHE_FILE, JSON.stringify(cache));
+  } catch (err) {
+    logger.warn(`缓存写入失败: ${err.message}`);
+  }
+}
+
+/** 缓存 TTL 按上游端点区分 */
+function ttlFor(target) {
+  return target.startsWith(LYRIC_TARGET) ? LYRIC_TTL_MS : SEARCH_TTL_MS;
+}
+
+/** 淘汰最旧条目，控制缓存体积 */
+function pruneCache() {
+  const keys = Object.keys(cache);
+  if (keys.length <= CACHE_MAX_ENTRIES) return;
+  keys
+    .map((k) => [k, cache[k].ts ?? 0])
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, keys.length - CACHE_MAX_ENTRIES)
+    .forEach(([k]) => delete cache[k]);
+}
 
 /** QQ 音乐上游固定端点（白名单，防 SSRF） */
 const SEARCH_TARGET = 'https://c.y.qq.com/soso/fcgi-bin/client_search_cp';
@@ -154,20 +195,83 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // 转发端点
+  // 转发端点（带持久化缓存）
   // 注意：writeHead 必须用单个合并对象——三参数形式 (status, obj1, obj2) 会丢弃 obj1 的 CORS 头，
   // 导致 CEF 内 CORS 校验失败（"Failed to fetch"），而外部 curl 不查 CORS 故难以察觉。
   try {
+    const now = Date.now();
+    const ttl = ttlFor(resolved.target);
+    const entry = cache[resolved.target];
+
+    // 1. 新鲜缓存直接命中（不请求上游，规避搜索接口频控）
+    if (entry && now - entry.ts < ttl) {
+      accessLog(`GET ${req.url} → 200(cache age=${Math.round((now - entry.ts) / 60000)}min) origin=${origin ?? '-'}`);
+      res.writeHead(200, {
+        ...corsHeaders(origin),
+        'Content-Type': entry.contentType ?? 'application/json',
+        'X-QQProxy-Cache': 'hit',
+      });
+      res.end(entry.body);
+      return;
+    }
+
+    // 2. 缓存缺失/过期 → 请求上游
     const upstream = await fetch(resolved.target, { headers: UPSTREAM_HEADERS });
     const body = await upstream.text();
+
+    // 2a. 成功 → 更新缓存（歌词仅缓存有内容的响应，避免锁死"无歌词"结果）
+    if (upstream.status === 200 && body) {
+      const isLyric = resolved.target.startsWith(LYRIC_TARGET);
+      if (!isLyric || body.includes('"lyric":"')) {
+        cache[resolved.target] = {
+          body,
+          contentType: upstream.headers.get('content-type') ?? 'application/json',
+          ts: now,
+        };
+        pruneCache();
+        saveCache();
+      }
+      accessLog(`GET ${req.url} → 200(store) len=${body.length} origin=${origin ?? '-'}`);
+      res.writeHead(200, {
+        ...corsHeaders(origin),
+        'Content-Type': upstream.headers.get('content-type') ?? 'application/json',
+      });
+      res.end(body);
+      return;
+    }
+
+    // 2b. 上游异常（如搜索接口被频控 500）→ 降级返回过期缓存（stale-while-error）
+    if (entry) {
+      accessLog(`GET ${req.url} → 200(stale age=${Math.round((now - entry.ts) / 3600000)}h upstream=${upstream.status}) origin=${origin ?? '-'}`);
+      res.writeHead(200, {
+        ...corsHeaders(origin),
+        'Content-Type': entry.contentType ?? 'application/json',
+        'X-QQProxy-Cache': 'stale',
+      });
+      res.end(entry.body);
+      return;
+    }
+
+    // 2c. 无缓存可用 → 透传上游状态（调用方降级到其他歌词源）
     accessLog(`GET ${req.url} → ${upstream.status} len=${body.length} origin=${origin ?? '-'}`);
-    const headers = {
+    res.writeHead(upstream.status, {
       ...corsHeaders(origin),
       'Content-Type': upstream.headers.get('content-type') ?? 'application/json',
-    };
-    res.writeHead(upstream.status, headers);
+    });
     res.end(body);
   } catch (err) {
+    // 网络异常也尝试过期缓存兜底
+    const entry = cache[resolved.target];
+    if (entry) {
+      accessLog(`GET ${req.url} → 200(stale network-err) origin=${origin ?? '-'}`);
+      res.writeHead(200, {
+        ...corsHeaders(origin),
+        'Content-Type': entry.contentType ?? 'application/json',
+        'X-QQProxy-Cache': 'stale',
+      });
+      res.end(entry.body);
+      return;
+    }
     accessLog(`GET ${req.url} → 502 ${err.message} origin=${origin ?? '-'}`);
     logger.error(`代理转发失败: ${err.message}`);
     res.writeHead(502, corsHeaders(origin));

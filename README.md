@@ -83,6 +83,8 @@ node services/qqProxy.mjs
 ```
 
 > qqProxy 仅监听本机回环地址，且仅允许转发至 `c.y.qq.com` 白名单端点。代理未运行时 lyrics-plus 自动回退 LRCLIB 源，仅 QQ 音乐源不可用。
+>
+> 代理内置磁盘缓存（搜索 7 天 / 歌词 30 天）：已听过的歌重播时零上游请求，可规避 QQ 搜索接口频控；上游异常时自动降级用过期缓存。若搜索接口被频控（500）且缓存缺失，可运行 `node services/seed-cache-from-log.mjs` 从访问日志重建历史搜索缓存。
 
 > Spicetify 更新可能覆盖 lyrics-plus，歌词源失效时重新执行第 3 步即可（脚本幂等）。
 

@@ -15,6 +15,9 @@ android/local.properties
 *.log
 *.access.log
 
+# ── 运行时数据（各机器本地生成） ──
+windows/services/qq-proxy-cache.json
+
 # ── IDE / 系统文件 ──
 .idea/
 *.iml
