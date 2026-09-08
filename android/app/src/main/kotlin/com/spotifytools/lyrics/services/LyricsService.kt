@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Handler
@@ -12,6 +13,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import com.spotifytools.lyrics.modules.FloatingLyricsView
 import com.spotifytools.lyrics.ui.MainActivity
 import com.spotifytools.lyrics.utils.AppError
@@ -67,6 +69,7 @@ class LyricsService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification())
         ensureFloatingView()
         PlaybackBus.observe(playbackObserver)
+        mainHandler.post(rebindWatchdog)
         LogKit.i("LyricsService 已启动")
     }
 
@@ -196,6 +199,38 @@ class LyricsService : Service() {
         mainHandler.removeCallbacks(ticker)
     }
 
+    // ── 监听自愈看门狗 ──
+
+    private var lastRebindAt = 0L
+
+    /**
+     * 重绑看门狗：MIUI/HyperOS 在 App 进程被杀后不会自动重绑通知监听
+     * （系统 rebind 被自启动管理拦截/吞掉，实测多次），导致「等待播放」永不恢复。
+     * 本前台服务存活期间每 10s 检查一次：监听掉线且有权限 → 请求重绑（节流 15s）。
+     * 自启动已授权后重绑即成功；首次触发可能因系统背压稍延迟，属正常。
+     */
+    private val rebindWatchdog = object : Runnable {
+        override fun run() {
+            try {
+                if (!PlaybackListenerService.listenerConnected && hasListenerPermission()) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastRebindAt > REBIND_THROTTLE_MS) {
+                        lastRebindAt = now
+                        NotificationListenerService.requestRebind(
+                            ComponentName(this@LyricsService, PlaybackListenerService::class.java),
+                        )
+                        LogKit.i("看门狗: 监听未连接，已请求系统重绑")
+                    }
+                }
+            } catch (_: Exception) { /* 下轮再试 */ }
+            mainHandler.postDelayed(this, WATCHDOG_MS)
+        }
+    }
+
+    private fun hasListenerPermission(): Boolean =
+        Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+            ?.contains(packageName) == true
+
     // ── 悬浮窗 ──
 
     private fun ensureFloatingView() {
@@ -237,6 +272,8 @@ class LyricsService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val TICK_MS = 500L
         private const val RETRY_MS = 20_000L   // 歌词获取失败后的重试间隔
+        private const val WATCHDOG_MS = 10_000L        // 监听看门狗检查间隔
+        private const val REBIND_THROTTLE_MS = 15_000L // 重绑请求节流
 
         /** 最近一次歌词来源（主界面展示用；null = 未获取/失败） */
         @Volatile

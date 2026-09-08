@@ -323,8 +323,8 @@ object QqMusicClient {
     private fun firstSinger(o: JSONObject): String =
         o.optJSONArray("singer")?.optJSONObject(0)?.optString("name")?.trim() ?: ""
 
-    /** HTTP GET（默认 8s 超时；connectTimeoutMs 可覆盖——代理用 2s 快速失败；非 200 与 IO 异常统一抛 IOException） */
-    private fun httpGet(urlStr: String, connectTimeoutMs: Int = 8_000): String {
+    /** HTTP GET（默认 5s 连接/8s 读取；connectTimeoutMs 可覆盖——代理用 2s 快速失败；非 200 与 IO 异常统一抛 IOException） */
+    private fun httpGet(urlStr: String, connectTimeoutMs: Int = 5_000): String {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         return try {
             conn.connectTimeout = connectTimeoutMs
@@ -345,7 +345,7 @@ object QqMusicClient {
     private fun httpPostJson(urlStr: String, json: String): String {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
         return try {
-            conn.connectTimeout = 8_000
+            conn.connectTimeout = 5_000
             conn.readTimeout = 8_000
             conn.requestMethod = "POST"
             conn.doOutput = true
