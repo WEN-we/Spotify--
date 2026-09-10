@@ -19,10 +19,13 @@ import com.spotifytools.lyrics.services.LyricRepository
  * FloatingLyricsSkill：悬浮窗歌词渲染（QQ音乐桌面歌词级）
  *
  * 双窗口架构：
- *  - 歌词窗口：解锁态全宽多行卡片（可拖动/双击）；锁定态单行纯文字、
+ *  - 歌词窗口：解锁态全宽多行卡片（可拖动/双击/✕关闭）；锁定态单行纯文字、
  *    宽度自适应、FLAG_NOT_TOUCHABLE（触摸完全穿透，零遮挡零拦截）
  *  - 锁按钮窗口：歌词右上角的小锁 🔓/🔒，始终可点击，
  *    点击直接锁定/解锁（无需回主界面）——与 QQ音乐桌面歌词交互一致
+ *
+ * 锁按钮自动隐藏（悬浮球式）：锁定态 6 秒无操作缩成半透明小圆点，
+ * 点圆点恢复完整按钮——不遮挡内容也不失联。
  *
  * 位置记忆：拖动后保存 y 坐标，重启/重建后恢复。
  * 规则：所有 UI 更新在主线程；权限未授予时由 LyricsService 决定不创建。
@@ -31,15 +34,20 @@ import com.spotifytools.lyrics.services.LyricRepository
 class FloatingLyricsView private constructor(
     private val context: Context,
     private val windowManager: WindowManager,
+    private val onClose: (() -> Unit)?,
 ) : LinearLayout(context) {
 
     private val lyricLines = ArrayList<TextView>()
     private var expanded = true
     private var locked = AppConfig.floatingLocked
 
+    // ✕ 关闭行（仅解锁态显示）
+    private lateinit var closeButton: TextView
+
     // 锁按钮（独立小窗口）
     private var lockButton: TextView? = null
     private var lockParams: WindowManager.LayoutParams? = null
+    private var lockShrunk = false   // 锁定态：锁按钮已缩成悬浮球
 
     // 最近一次渲染数据（双击切换模式时立即重绘，不等下一 tick）
     private var lastLines: List<LyricRepository.LrcLine> = emptyList()
@@ -53,6 +61,8 @@ class FloatingLyricsView private constructor(
         private const val GLOW_COLOR = 0xCC1DB954.toInt() // 当前行光晕（Spotify 绿）
         private const val LOCK_SIZE = 84           // 锁按钮尺寸（px）
         private const val LOCK_MARGIN = 24         // 锁按钮与歌词间距（px）
+        private const val LOCK_HIDE_MS = 6_000L    // 锁定态锁按钮自动隐藏延迟
+        private const val DOT_SIZE = 40            // 锁按钮收缩成悬浮球后的尺寸（px）
 
         private val BG_DRAWABLE = GradientDrawable().apply {
             setColor(0x99000000.toInt()) // 半透明黑卡片
@@ -67,11 +77,15 @@ class FloatingLyricsView private constructor(
             setColor(0xCC1DB954.toInt())
             cornerRadius = LOCK_SIZE / 2f
         }
+        private val LOCK_BG_DOT = GradientDrawable().apply {
+            setColor(0x662E2E30.toInt()) // 悬浮球：低透明度深灰
+            cornerRadius = DOT_SIZE / 2f
+        }
 
-        /** 创建并添加到窗口（须已持有悬浮窗权限） */
-        fun create(context: Context): FloatingLyricsView? = try {
+        /** 创建并添加到窗口（须已持有悬浮窗权限）；onClose = 用户点 ✕ */
+        fun create(context: Context, onClose: (() -> Unit)? = null): FloatingLyricsView? = try {
             val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-            val view = FloatingLyricsView(context, wm)
+            val view = FloatingLyricsView(context, wm, onClose)
             val savedY = AppConfig.floatingY
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -104,6 +118,17 @@ class FloatingLyricsView private constructor(
         setPadding(40, 28, 40, 28)
         background = BG_DRAWABLE
 
+        // ✕ 关闭行（仅解锁态显示；点按隐藏悬浮窗，换歌自动重现）
+        closeButton = TextView(context).apply {
+            text = "✕"
+            textSize = 13f
+            setTextColor(0x99FFFFFF.toInt())
+            setPadding(0, 0, 8, 8)
+            gravity = Gravity.END
+            setOnClickListener { onClose?.invoke() }
+        }
+        addView(closeButton, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+
         // 预建 5 行 TextView
         for (i in 0 until MAX_LINES) {
             val tv = TextView(context).apply {
@@ -128,7 +153,15 @@ class FloatingLyricsView private constructor(
                 textSize = 16f
                 gravity = Gravity.CENTER
                 background = if (locked) LOCK_BG_LOCKED else LOCK_BG_UNLOCKED
-                setOnClickListener { toggleLock() }
+                setOnClickListener {
+                    if (lockShrunk) {
+                        // 悬浮球态：第一下点按只展开按钮（不误触锁定切换）
+                        shrinkLock(false)
+                        scheduleLockHide()
+                    } else {
+                        toggleLock()
+                    }
+                }
             }
             lockParams = WindowManager.LayoutParams(
                 LOCK_SIZE,
@@ -142,6 +175,32 @@ class FloatingLyricsView private constructor(
             lockParams?.let { windowManager.addView(lockButton, it) }
             positionLockButton()
         } catch (_: Exception) { /* 锁按钮创建失败不影响歌词 */ }
+    }
+
+    // ── 锁按钮悬浮球式自动隐藏（锁定态 6s 无操作缩成小圆点） ──
+
+    private val hideLockRunnable = Runnable { shrinkLock(true) }
+
+    private fun scheduleLockHide() {
+        removeCallbacks(hideLockRunnable)
+        if (locked) postDelayed(hideLockRunnable, LOCK_HIDE_MS)
+    }
+
+    /** 缩起/展开锁按钮：悬浮球 = 小尺寸半透明无图标（仍可点击展开） */
+    private fun shrinkLock(shrink: Boolean) {
+        if (lockShrunk == shrink) return
+        val btn = lockButton ?: return
+        val params = lockParams ?: return
+        lockShrunk = shrink
+        try {
+            params.width = if (shrink) DOT_SIZE else LOCK_SIZE
+            params.height = if (shrink) DOT_SIZE else LOCK_SIZE
+            btn.alpha = if (shrink) 0.45f else 1f
+            btn.text = if (shrink) "" else if (locked) "🔒" else "🔓"
+            btn.background = if (shrink) LOCK_BG_DOT else if (locked) LOCK_BG_LOCKED else LOCK_BG_UNLOCKED
+            btn.textSize = if (shrink) 10f else 16f
+            windowManager.updateViewLayout(btn, params)
+        } catch (_: Exception) { /* 窗口已移除 */ }
     }
 
     /** 锁按钮跟随歌词窗口位置（右上角外挂） */
@@ -208,7 +267,18 @@ class FloatingLyricsView private constructor(
                 background = if (locked) LOCK_BG_LOCKED else LOCK_BG_UNLOCKED
             }
 
-            // 3. 重绘（锁定态自动切单行）
+            // 3. ✕ 关闭行仅解锁态显示
+            closeButton.visibility = if (locked) GONE else VISIBLE
+
+            // 4. 锁定态调度悬浮球隐藏；解锁态恢复完整按钮
+            if (locked) {
+                scheduleLockHide()
+            } else {
+                removeCallbacks(hideLockRunnable)
+                shrinkLock(false)
+            }
+
+            // 5. 重绘（锁定态自动切单行）
             if (lastIndex >= 0) renderInternal(lastLines, lastIndex)
 
             try {
@@ -339,6 +409,7 @@ class FloatingLyricsView private constructor(
     }
 
     fun destroy() {
+        removeCallbacks(hideLockRunnable)
         try {
             windowManager.removeView(this)
         } catch (_: Exception) { /* 已移除 */ }

@@ -8,6 +8,9 @@ import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -43,10 +46,25 @@ class LyricsService : Service() {
     private var currentLines: List<LyricRepository.LrcLine> = emptyList()
     private var currentPlayback: PlaybackBus.State? = null
 
-    // 歌词重试：fetch 失败（网络瞬断等）后不重试会导致整首歌空白，
-    // 轮询状态发布时按间隔自动重试（RETRY_MS 内不重复）
+    // 歌词重试：fetch 失败（网络瞬断等）后不重试会导致整首歌空白。
+    // 分级：首次失败 6s 快速重试（网络抖动居多），连续失败退避到 20s（接口频控期不轰炸）
     private var fetching = false
     private var lastFetchFailAt = 0L
+    private var retryCount = 0
+
+    // 用户 ✕ 关闭的曲目：该曲目内不再重建悬浮窗（换歌自动重现）
+    private var dismissedForTrackId: String? = null
+
+    // 网络恢复回调：无网期间失败的歌，网络一回来立即重取（不等重试定时）
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    // 按需生命周期：Spotify 无会话时自动退出，避免常驻后台（Spotify 播放时由监听服务自动拉起）
+    private val idleStopRunnable = Runnable {
+        if (currentPlayback == null) {
+            LogKit.i("无播放会话，歌词服务自动退出（Spotify 播放时自动重启）")
+            stopSelf()
+        }
+    }
 
     // 歌词滚动定时器（500ms）
     private val ticker = object : Runnable {
@@ -70,6 +88,9 @@ class LyricsService : Service() {
         ensureFloatingView()
         PlaybackBus.observe(playbackObserver)
         mainHandler.post(rebindWatchdog)
+        registerNetworkCallback()
+        // 按需生命周期：创建后一段时间仍无播放会话 → 自动退出（通知消失，后台零占用）
+        mainHandler.postDelayed(idleStopRunnable, CREATE_IDLE_MS)
         LogKit.i("LyricsService 已启动")
     }
 
@@ -84,6 +105,13 @@ class LyricsService : Service() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacksAndMessages(null)
+        networkCallback?.let {
+            try {
+                (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
+                    .unregisterNetworkCallback(it)
+            } catch (_: Exception) { /* 未注册 */ }
+        }
+        networkCallback = null
         PlaybackBus.removeObserver(playbackObserver)
         floatingView?.destroy()
         floatingView = null
@@ -101,31 +129,76 @@ class LyricsService : Service() {
         currentPlayback = state
 
         if (state == null) {
-            // 停止播放：暂停定时器，移除悬浮窗（WindowManager 根视图 visibility 不可靠）
+            // 停止播放：暂停定时器，移除悬浮窗；30s 后仍无会话 → 服务自动退出
             stopTicker()
             floatingView?.destroy()
             floatingView = null
+            mainHandler.postDelayed(idleStopRunnable, SESSION_LOST_MS)
             return
         }
 
+        // 有会话：取消空闲退出
+        mainHandler.removeCallbacks(idleStopRunnable)
+
         ensureFloatingView()
 
-        // 切歌：获取新歌词
+        // 切歌：优先用音乐软件自带歌词（有则零网络延迟），否则走网络源
         if (state.trackId != currentTrackId) {
             currentTrackId = state.trackId
             currentLines = emptyList()
             lastSource = null
-            fetchLyrics(state)
+            retryCount = 0
+            dismissedForTrackId = null   // 换歌自动重现被 ✕ 关闭的悬浮窗
+            ensureFloatingView()
+
+            val sessionLrc = state.sessionLyrics?.let { repository.fromSessionLrc(it) }
+            if (sessionLrc != null) {
+                currentLines = sessionLrc.lines
+                lastSource = sessionLrc.source
+                renderCurrentLine()
+            } else {
+                fetchLyrics(state)
+            }
         } else if (currentLines.isEmpty() && !fetching && state.isPlaying &&
-            SystemClock.elapsedRealtime() - lastFetchFailAt > RETRY_MS
+            SystemClock.elapsedRealtime() - lastFetchFailAt > retryWaitMs()
         ) {
-            // 同曲目但无歌词且此前失败：自动重试（轮询状态发布触发，RETRY_MS 节流）
+            // 同曲目但无歌词且此前失败：按分级间隔自动重试（轮询状态发布触发）
             fetchLyrics(state)
         }
 
         // 播放/暂停切换定时器
         if (state.isPlaying) startTicker() else stopTicker()
         renderCurrentLine()
+    }
+
+    /** 分级重试间隔：首次失败 6s（多为网络抖动），连续失败退避 20s（频控期不轰炸） */
+    private fun retryWaitMs(): Long = if (retryCount == 0) FIRST_RETRY_MS else RETRY_MS
+
+    private fun isNetworkOnline(): Boolean = try {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val nw = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(nw) ?: return false
+        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    } catch (_: Exception) {
+        false
+    }
+
+    /** 网络恢复即重取：无网期间失败的歌，网络一回来立即重取（不等重试定时） */
+    private fun registerNetworkCallback() {
+        try {
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    mainHandler.post {
+                        val st = currentPlayback ?: return@post
+                        if (currentLines.isEmpty() && !fetching) fetchLyrics(st)
+                    }
+                }
+            }
+            (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
+                .registerDefaultNetworkCallback(networkCallback!!)
+        } catch (_: Exception) {
+            networkCallback = null
+        }
     }
 
     private fun fetchLyrics(state: PlaybackBus.State) {
@@ -149,14 +222,17 @@ class LyricsService : Service() {
                 .onFailure { err ->
                     currentLines = emptyList()
                     lastSource = null
-                    // 网络类失败记录时间，RETRY_MS 后由轮询状态触发自动重试；
+                    // 网络类失败记录时间，按分级间隔自动重试；
                     // NO_RESULT（曲库确认无此歌）不重试，避免无效请求
                     if (err.code != AppError.CODE_NO_RESULT) {
+                        retryCount++
                         lastFetchFailAt = SystemClock.elapsedRealtime()
                     }
                     floatingView?.showHint(when (err.code) {
                         AppError.CODE_NO_RESULT -> "未找到歌词"
-                        AppError.CODE_NETWORK -> "网络不可用"
+                        // 网络可用却失败 = 接口瞬断/频控，别误导用户「无网络」
+                        AppError.CODE_NETWORK ->
+                            if (isNetworkOnline()) "获取失败，自动重试中…" else "等待网络连接…"
                         else -> "歌词加载失败"
                     })
                 }
@@ -239,8 +315,18 @@ class LyricsService : Service() {
             LogKit.d("悬浮窗权限未授予，暂不创建（等待授权）")
             return
         }
-        floatingView = FloatingLyricsView.create(this)
+        // 当前曲目被用户 ✕ 关闭 → 本曲内不重建（换歌自动重现）
+        if (currentTrackId != null && currentTrackId == dismissedForTrackId) return
+        floatingView = FloatingLyricsView.create(this) { dismissFloating() }
         if (floatingView == null) LogKit.e("悬浮窗创建失败")
+    }
+
+    /** 用户点 ✕：隐藏悬浮窗（服务继续运行），换歌自动重现 */
+    private fun dismissFloating() {
+        dismissedForTrackId = currentTrackId
+        floatingView?.destroy()
+        floatingView = null
+        LogKit.i("悬浮窗已由用户关闭（换歌自动重现）")
     }
 
     // ── 前台通知 ──
@@ -271,9 +357,12 @@ class LyricsService : Service() {
     companion object {
         private const val NOTIFICATION_ID = 1001
         private const val TICK_MS = 500L
-        private const val RETRY_MS = 20_000L   // 歌词获取失败后的重试间隔
+        private const val FIRST_RETRY_MS = 6_000L    // 首次失败快速重试（网络抖动居多）
+        private const val RETRY_MS = 20_000L         // 连续失败退避间隔（频控期不轰炸）
         private const val WATCHDOG_MS = 10_000L        // 监听看门狗检查间隔
         private const val REBIND_THROTTLE_MS = 15_000L // 重绑请求节流
+        private const val CREATE_IDLE_MS = 45_000L     // 创建后无播放会话的退出时限
+        private const val SESSION_LOST_MS = 30_000L    // Spotify 会话消失后的退出宽限（防会话重建抖动）
 
         /** 最近一次歌词来源（主界面展示用；null = 未获取/失败） */
         @Volatile

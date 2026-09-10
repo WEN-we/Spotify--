@@ -10,6 +10,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import com.spotifytools.lyrics.config.AppConfig
 import com.spotifytools.lyrics.utils.LogKit
 
 /**
@@ -134,6 +135,8 @@ class PlaybackListenerService : NotificationListenerService() {
                 spotifyBound = true
                 LogKit.i("已绑定 Spotify MediaSession")
                 publishState()
+                // 按需生命周期：发现 Spotify 播放会话 → 自动拉起歌词服务（空闲时服务已自退出）
+                if (AppConfig.floatingEnabled) LyricsService.start(this@PlaybackListenerService)
             }
         } catch (e: Exception) {
             LogKit.e("绑定 MediaSession 失败: ${e.message}", e)
@@ -154,6 +157,11 @@ class PlaybackListenerService : NotificationListenerService() {
         val album = metadata.getString(android.media.MediaMetadata.METADATA_KEY_ALBUM) ?: ""
         val duration = metadata.getLong(android.media.MediaMetadata.METADATA_KEY_DURATION)
         val pb = controller.playbackState
+        // 音乐软件自带歌词（部分播放器会放进 MediaSession；Spotify 多数版本为空）。
+        // 注意：LYRICS 键在 MediaMetadata 中无 Java 常量，用官方键名字符串
+        val sessionLyrics = metadata.getString("android.media.metadata.LYRICS")
+            ?.trim()?.takeIf { it.isNotEmpty() }
+        if (sessionLyrics != null) LogKit.d("Spotify自带歌词: ${sessionLyrics.length}字符")
 
         val state = PlaybackBus.State(
             trackId = "$title|$artist|$duration",
@@ -168,6 +176,7 @@ class PlaybackListenerService : NotificationListenerService() {
             // 缓冲中也算播放中（歌词继续走，避免加载间隙歌词停摆）
             isPlaying = pb?.state == PlaybackState.STATE_PLAYING ||
                 pb?.state == PlaybackState.STATE_BUFFERING,
+            sessionLyrics = sessionLyrics,
         )
         PlaybackBus.publish(state)
     }

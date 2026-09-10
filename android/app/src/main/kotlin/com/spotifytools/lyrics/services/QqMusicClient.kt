@@ -7,7 +7,6 @@ import com.spotifytools.lyrics.utils.LogKit
 import com.spotifytools.lyrics.utils.Result
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -335,7 +334,7 @@ object QqMusicClient {
             conn.setRequestProperty("Referer", "https://y.qq.com/")
             val code = conn.responseCode
             if (code != 200) throw java.io.IOException("HTTP $code")
-            conn.inputStream.bufferedReader().use(BufferedReader::readText)
+            decodeSmart(conn.inputStream.use { it.readBytes() })
         } finally {
             conn.disconnect()
         }
@@ -355,10 +354,21 @@ object QqMusicClient {
             conn.outputStream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             if (code != 200) throw java.io.IOException("HTTP $code")
-            conn.inputStream.bufferedReader().use(BufferedReader::readText)
+            decodeSmart(conn.inputStream.use { it.readBytes() })
         } finally {
             conn.disconnect()
         }
+    }
+
+    /**
+     * 编码嗅探解码：QQ fcg 接口偶发返回 GBK 内容（Content-Type 未声明或错误），
+     * 强按 UTF-8 解码会出现替换符（U+FFFD）→ 此时限定时改按 GBK 解码，修复歌词乱码。
+     */
+    private fun decodeSmart(bytes: ByteArray): String {
+        val utf8 = String(bytes, Charsets.UTF_8)
+        // 含替换符 = 大概率 GBK 内容被强按 UTF-8 解
+        if (!utf8.contains('\uFFFD')) return utf8
+        return runCatching { String(bytes, charset("GBK")) }.getOrDefault(utf8)
     }
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")

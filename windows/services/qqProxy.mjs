@@ -169,6 +169,18 @@ function resolveTarget(pathname, searchParams) {
   return null;
 }
 
+/** 上游响应智能解码：QQ fcg 接口偶发返回 GBK 内容，强按 UTF-8 会出现替换符（U+FFFD）
+ *  → 检测到即改按 GBK 解码，防止乱码歌词进入缓存/客户端 */
+function decodeUpstream(buf) {
+  const utf8 = new TextDecoder('utf-8').decode(buf);
+  if (!utf8.includes('\uFFFD')) return utf8;
+  try {
+    return new TextDecoder('gbk').decode(buf);
+  } catch {
+    return utf8;
+  }
+}
+
 /** musicu.fcg 桌面端搜索（POST JSON），响应转经典 client_search_cp 格式；
  *  成功且非空返回经典格式 body，失败（频控/解析/空结果）返回 null —— 调用方保持原上游错误 */
 async function searchViaMusicu(query) {
@@ -187,7 +199,7 @@ async function searchViaMusicu(query) {
       signal: AbortSignal.timeout(8000),
     });
     if (res.status !== 200) return null;
-    const root = JSON.parse(await res.text());
+    const root = JSON.parse(decodeUpstream(await res.arrayBuffer()));
     // 频控返回 HTTP 200 + {"code":500001,...}；非 0 一律视为失败
     if ((root?.code ?? 0) !== 0) return null;
     const list = root?.req_1?.data?.body?.song?.list;
@@ -267,7 +279,7 @@ const server = createServer(async (req, res) => {
 
     // 2. 缓存缺失/过期 → 请求上游
     let upstream = await fetch(resolved.target, { headers: UPSTREAM_HEADERS });
-    let body = await upstream.text();
+    let body = decodeUpstream(await upstream.arrayBuffer());
 
     // 2-降级. 搜索端点上游失败（搜索接口封锁 500/空响应）→ 内部尝试 musicu.fcg 桌面端点，
     //    响应转经典格式后对客户端透明（Windows CEF 与 Android 均按经典格式解析，零改动受益）

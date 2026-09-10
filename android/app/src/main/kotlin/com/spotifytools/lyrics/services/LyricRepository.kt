@@ -52,6 +52,18 @@ class LyricRepository(context: Context) {
     fun evict(trackName: String, artistName: String) = cache.evict(trackName, artistName)
 
     /**
+     * 音乐软件自带歌词（MediaSession METADATA_KEY_LYRICS）解析：
+     * 需为 LRC 格式（含 [mm:ss] 时间戳）才算有效；解析成功返回带「Spotify」来源的结果
+     * （繁转简随全局开关），非 LRC 文本返回 null → 上层走网络源。
+     */
+    fun fromSessionLrc(lrc: String): FetchResult? {
+        val lines = runCatching { sanitize(LrcParser.parse(lrc)) }.getOrNull().orEmpty()
+        if (lines.isEmpty()) return null
+        LogKit.i("使用音乐软件自带歌词: ${lines.size} 行")
+        return FetchResult(convert(lines), "Spotify")
+    }
+
+    /**
      * 双源并行竞速：LRCLIB 与 QQ音乐同时发起，先成功者胜出（不等慢源）。
      * 全部失败时聚合错误：network 类优先（供 LyricsService 20s 重试）。
      */

@@ -24,6 +24,7 @@ object PlaybackBus {
         val lastUpdateTime: Long,     // 快照时间戳（SystemClock.elapsedRealtime 基准）
         val playbackSpeed: Float,    // 播放速率（外推用）
         val isPlaying: Boolean,
+        val sessionLyrics: String? = null,  // 音乐软件自带的歌词（MediaSession 提供；多数版本为 null）
     ) {
         /** 实时进度（按播放速率线性外推，elapsedRealtime 单调递增） */
         fun currentPosition(): Long {
